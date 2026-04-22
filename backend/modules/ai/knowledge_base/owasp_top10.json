@@ -1,0 +1,94 @@
+{
+  "owasp_top10": [
+    {
+      "id": "A01:2021",
+      "name": "Broken Access Control",
+      "description": "Access control enforces policy such that users cannot act outside of their intended permissions. Failures typically lead to unauthorized information disclosure, modification, or destruction of all data, or performing a business function outside the user's limits.",
+      "impact": "Attackers can exploit broken access controls to access unauthorized functionality or data, modify or delete data, perform privileged actions, and gain full admin access.",
+      "examples": ["Path traversal", "Forced browsing", "IDOR (Insecure Direct Object References)", "Privilege escalation", "CORS misconfiguration"],
+      "fix": "Deny by default. Implement server-side access control. Log access control failures. Rate limit API and controller access. Invalidate JWT tokens on logout.",
+      "severity": "critical"
+    },
+    {
+      "id": "A02:2021",
+      "name": "Cryptographic Failures",
+      "description": "Failures related to cryptography which often lead to sensitive data exposure or system compromise. Previously known as 'Sensitive Data Exposure'.",
+      "impact": "Sensitive data transmitted or stored in cleartext. Weak or outdated cryptographic algorithms. Improper certificate validation.",
+      "examples": ["Cleartext HTTP for sensitive data", "Weak MD5/SHA1 hashes", "Missing HSTS header", "Self-signed certificates", "Weak TLS versions (TLS 1.0/1.1)"],
+      "fix": "Classify sensitive data. Encrypt data at rest and in transit. Use strong, modern cryptography (AES-256, TLS 1.2+). Enforce HTTPS via HSTS. Do not use MD5/SHA1 for passwords.",
+      "severity": "high"
+    },
+    {
+      "id": "A03:2021",
+      "name": "Injection",
+      "description": "Injection flaws occur when untrusted data is sent to an interpreter as part of a command or query. SQL, NoSQL, OS command, LDAP injection are common forms.",
+      "impact": "Full database compromise. Authentication bypass. Data exfiltration. Remote code execution. Complete system takeover.",
+      "examples": ["SQL Injection", "Command Injection", "LDAP Injection", "XPath Injection", "NoSQL Injection"],
+      "fix": "Use parameterized queries/prepared statements. Validate and sanitize all inputs. Use an ORM. Apply least privilege to database accounts. Use WAF as additional layer.",
+      "severity": "critical"
+    },
+    {
+      "id": "A04:2021",
+      "name": "Insecure Design",
+      "description": "Insecure design is a broad category representing different weaknesses, expressed as 'missing or ineffective control design.' This is distinct from insecure implementation.",
+      "impact": "Business logic flaws. Missing security controls. Insecure architecture decisions that cannot be fixed by correct implementation.",
+      "examples": ["Missing rate limiting", "No multi-factor authentication", "Insecure password recovery", "Lack of fraud controls"],
+      "fix": "Use threat modeling during design. Integrate security requirements in the design phase. Use design patterns with security in mind. Perform security-focused peer reviews.",
+      "severity": "high"
+    },
+    {
+      "id": "A05:2021",
+      "name": "Security Misconfiguration",
+      "description": "Security misconfiguration is the most commonly seen issue. This is commonly a result of insecure default configurations, incomplete or ad hoc configurations, open cloud storage, misconfigured HTTP headers, and verbose error messages.",
+      "impact": "Full system compromise. Data leakage. Unauthorized access. Remote code execution via exposed admin panels.",
+      "examples": ["Default credentials", "Unnecessary features enabled", "Verbose error messages", "Missing security headers", "Exposed .git or .env files"],
+      "fix": "Implement secure configuration management. Disable unnecessary features. Review and update configurations. Automate configuration validation. Remove default accounts.",
+      "severity": "high"
+    },
+    {
+      "id": "A06:2021",
+      "name": "Vulnerable and Outdated Components",
+      "description": "Components such as libraries, frameworks, and other software modules run with the same privileges as the application. If a vulnerable component is exploited, such an attack can facilitate serious data loss or server takeover.",
+      "impact": "Remote code execution. Data exfiltration. Denial of service. Full application compromise via known public CVEs.",
+      "examples": ["Outdated WordPress/plugins", "Unpatched Apache/nginx", "Outdated JavaScript libraries", "End-of-life operating system"],
+      "fix": "Continuously inventory component versions. Monitor for vulnerabilities (CVE databases). Subscribe to security advisories. Apply patches promptly. Remove unused dependencies.",
+      "severity": "high"
+    },
+    {
+      "id": "A07:2021",
+      "name": "Identification and Authentication Failures",
+      "description": "Previously known as 'Broken Authentication'. Confirmation of the user's identity, authentication, and session management is critical.",
+      "impact": "Account takeover. Identity fraud. Unauthorized access to sensitive data and functions.",
+      "examples": ["Weak passwords allowed", "No brute-force protection", "Insecure session tokens", "Missing MFA for admin", "Predictable session IDs"],
+      "fix": "Implement MFA. Use strong password policies. Limit failed login attempts. Expire sessions properly. Use secure, random session tokens. Do not expose session IDs in URLs.",
+      "severity": "critical"
+    },
+    {
+      "id": "A08:2021",
+      "name": "Software and Data Integrity Failures",
+      "description": "This category focuses on making assumptions related to software updates, critical data, and CI/CD pipelines without verifying integrity.",
+      "impact": "Malicious code execution via supply chain attacks. Data tampering. Unauthorized system modifications.",
+      "examples": ["Unsigned software updates", "Insecure deserialization", "Compromised CI/CD pipeline", "Unverified npm/PyPI packages"],
+      "fix": "Use digital signatures for software and data. Verify integrity of packages before use. Use trusted update channels. Implement CI/CD security checks. Avoid deserializing untrusted data.",
+      "severity": "high"
+    },
+    {
+      "id": "A09:2021",
+      "name": "Security Logging and Monitoring Failures",
+      "description": "Without logging and monitoring, breaches cannot be detected. Insufficient logging and monitoring, including insufficient response, allows attackers to further attack systems.",
+      "impact": "Breach goes undetected for extended periods. Loss of forensic evidence. Inability to respond to active attacks. Compliance violations.",
+      "examples": ["No audit logs", "Logs not monitored", "No alerting on failed logins", "Log injection vulnerabilities", "Logs not protected from tampering"],
+      "fix": "Log all authentication events, access control failures, and input validation failures. Ensure logs have sufficient context. Implement alerting for suspicious activity. Protect logs from tampering.",
+      "severity": "medium"
+    },
+    {
+      "id": "A10:2021",
+      "name": "Server-Side Request Forgery (SSRF)",
+      "description": "SSRF flaws occur whenever a web application is fetching a remote resource without validating the user-supplied URL. An attacker can coerce the application to send a crafted request to an unexpected destination.",
+      "impact": "Internal network scanning. Accessing cloud metadata services (AWS/GCP IMDS). Remote code execution. Data exfiltration from internal services.",
+      "examples": ["Fetching user-supplied URLs without validation", "Webhook URL manipulation", "PDF generators fetching internal URLs"],
+      "fix": "Validate and sanitize all client-supplied input URLs. Use an allowlist of permitted domains. Disable HTTP redirections. Do not send raw responses to clients. Block private IP ranges in URL validator.",
+      "severity": "high"
+    }
+  ]
+}

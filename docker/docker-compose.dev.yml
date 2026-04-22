@@ -1,0 +1,38 @@
+# SentinelX — Development Infrastructure
+# Runs PostgreSQL + Redis for local backend development
+# Usage: docker compose -f docker/docker-compose.dev.yml up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinelx-db
+    environment:
+      POSTGRES_USER: sentinelx
+      POSTGRES_PASSWORD: sentinelx_secret
+      POSTGRES_DB: sentinelx
+    ports:
+      - "5433:5432"
+    volumes:
+      - sentinelx_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinelx"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: sentinelx-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - sentinelx_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  sentinelx_pgdata:
+  sentinelx_redis:

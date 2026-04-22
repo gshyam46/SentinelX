@@ -1,0 +1,104 @@
+{
+  "security_headers": [
+    {
+      "name": "Strict-Transport-Security",
+      "alias": "HSTS",
+      "required": true,
+      "recommended_value": "max-age=31536000; includeSubDomains; preload",
+      "impact_if_missing": "Users can be downgraded to HTTP and become vulnerable to man-in-the-middle attacks. Session cookies can be intercepted.",
+      "fix": "Add 'Strict-Transport-Security: max-age=31536000; includeSubDomains' to all HTTPS responses. Submit to HSTS preload list at hstspreload.org after testing.",
+      "severity": "high",
+      "keywords": ["HSTS", "strict transport security", "HTTPS enforcement", "MitM"]
+    },
+    {
+      "name": "Content-Security-Policy",
+      "alias": "CSP",
+      "required": true,
+      "recommended_value": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none';",
+      "impact_if_missing": "Cross-Site Scripting (XSS) attacks can execute arbitrary JavaScript in users' browsers. Data exfiltration and session hijacking risk.",
+      "fix": "Implement a Content-Security-Policy header. Start with 'default-src self' and progressively allow necessary sources. Use CSP nonces for inline scripts. Test with report-only mode first.",
+      "severity": "high",
+      "keywords": ["CSP", "content security policy", "XSS", "cross-site scripting", "clickjacking"]
+    },
+    {
+      "name": "X-Frame-Options",
+      "alias": "XFO",
+      "required": true,
+      "recommended_value": "DENY",
+      "impact_if_missing": "Clickjacking attacks can embed your site in an iframe and trick users into performing unintended actions (e.g., unauthorized fund transfers, settings changes).",
+      "fix": "Add 'X-Frame-Options: DENY' or 'SAMEORIGIN'. Prefer using frame-ancestors in CSP for modern browsers. Both headers can coexist for backward compatibility.",
+      "severity": "medium",
+      "keywords": ["X-Frame-Options", "clickjacking", "framing", "iframe"]
+    },
+    {
+      "name": "X-Content-Type-Options",
+      "alias": "XCTO",
+      "required": true,
+      "recommended_value": "nosniff",
+      "impact_if_missing": "Browsers may MIME-sniff responses and execute files as different content types. An attacker-controlled image upload could be executed as JavaScript.",
+      "fix": "Add 'X-Content-Type-Options: nosniff' to all responses. This is a simple, low-risk header with high security value.",
+      "severity": "medium",
+      "keywords": ["X-Content-Type-Options", "MIME sniffing", "content type", "nosniff"]
+    },
+    {
+      "name": "Referrer-Policy",
+      "alias": "RP",
+      "required": false,
+      "recommended_value": "strict-origin-when-cross-origin",
+      "impact_if_missing": "The full URL including query parameters (potentially containing sensitive data like tokens, session IDs) is sent in the Referer header to third-party sites.",
+      "fix": "Add 'Referrer-Policy: strict-origin-when-cross-origin' to limit referrer information sent cross-origin.",
+      "severity": "low",
+      "keywords": ["Referrer-Policy", "referrer", "information disclosure"]
+    },
+    {
+      "name": "Permissions-Policy",
+      "alias": "Feature-Policy",
+      "required": false,
+      "recommended_value": "camera=(), microphone=(), geolocation=(), payment=()",
+      "impact_if_missing": "Malicious scripts injected via XSS could access device APIs (camera, microphone, location) without user consent.",
+      "fix": "Add 'Permissions-Policy' header to explicitly disable browser features your application doesn't use.",
+      "severity": "low",
+      "keywords": ["Permissions-Policy", "Feature-Policy", "browser API", "camera", "microphone"]
+    },
+    {
+      "name": "Cache-Control",
+      "alias": "Cache-Control",
+      "required": false,
+      "recommended_value": "no-store, no-cache (for sensitive pages)",
+      "impact_if_missing": "Sensitive data may be cached in browser history or shared caches, leaking information to subsequent users on shared computers.",
+      "fix": "Add 'Cache-Control: no-store' for pages containing sensitive data (dashboards, profile pages, admin panels).",
+      "severity": "low",
+      "keywords": ["Cache-Control", "caching", "sensitive data", "browser cache"]
+    },
+    {
+      "name": "Server",
+      "alias": "Server Header",
+      "required": false,
+      "recommended_value": "Remove or obfuscate",
+      "impact_if_missing": "Exposes web server software and version, helping attackers identify known CVEs for your exact server version.",
+      "fix": "Remove or obfuscate the Server header. In nginx: 'server_tokens off;'. In Apache: 'ServerTokens Prod; ServerSignature Off;'.",
+      "severity": "low",
+      "keywords": ["server header", "version disclosure", "fingerprinting", "server banner"]
+    },
+    {
+      "name": "X-Powered-By",
+      "alias": "X-Powered-By",
+      "required": false,
+      "recommended_value": "Remove",
+      "impact_if_missing": "Reveals application framework and version (e.g., 'PHP/8.1.0', 'Express'), aiding targeted attacks against known vulnerabilities.",
+      "fix": "Disable X-Powered-By in your framework config. In Express: 'app.disable(\"x-powered-by\")'. In PHP: 'expose_php = Off' in php.ini.",
+      "severity": "info",
+      "keywords": ["X-Powered-By", "technology disclosure", "PHP", "Express", "framework fingerprinting"]
+    },
+    {
+      "name": "Access-Control-Allow-Origin",
+      "alias": "CORS",
+      "required": false,
+      "recommended_value": "Specific origin, not wildcard (*)",
+      "impact_if_missing": "CORS misconfiguration (wildcard *) allows any malicious website to make authenticated cross-origin requests on behalf of logged-in users.",
+      "fix": "Specify exact allowed origins. Never use '*' with credentials. Validate Origin against a whitelist. Return specific origins, not a wildcard.",
+      "severity": "high",
+      "keywords": ["CORS", "Access-Control-Allow-Origin", "cross-origin", "wildcard"]
+    }
+  ]
+}

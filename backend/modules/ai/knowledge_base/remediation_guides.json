@@ -1,0 +1,158 @@
+{
+  "remediation_guides": [
+    {
+      "vulnerability_type": "SQL Injection",
+      "keywords": ["SQL injection", "SQLi", "database injection", "UNION SELECT"],
+      "immediate_actions": [
+        "Identify and temporarily disable the affected endpoint if actively exploited",
+        "Review all database query code for string concatenation with user input",
+        "Enable detailed SQL logging to identify attempted injection payloads"
+      ],
+      "fix_steps": [
+        "Replace all raw SQL queries with parameterized queries or prepared statements",
+        "Use an ORM (SQLAlchemy, Django ORM, Hibernate) instead of raw SQL",
+        "Apply input validation and type checking on all user-supplied parameters",
+        "Grant database users minimum required privileges (principle of least privilege)",
+        "Implement a Web Application Firewall (WAF) as an additional defense layer",
+        "Run automated SQL injection tests using sqlmap in your CI/CD pipeline"
+      ],
+      "code_examples": {
+        "python_bad": "cursor.execute(\"SELECT * FROM users WHERE id = \" + user_id)",
+        "python_good": "cursor.execute(\"SELECT * FROM users WHERE id = %s\", (user_id,))"
+      }
+    },
+    {
+      "vulnerability_type": "Cross-Site Scripting (XSS)",
+      "keywords": ["XSS", "cross-site scripting", "script injection", "JavaScript injection", "reflected XSS", "stored XSS"],
+      "immediate_actions": [
+        "Identify all output points that reflect user input without encoding",
+        "Add Content-Security-Policy header as an immediate mitigation",
+        "Review recent logs for active exploitation attempts"
+      ],
+      "fix_steps": [
+        "HTML-encode all user-controlled data before rendering in HTML context",
+        "Use a modern template engine with auto-escaping (Jinja2, React JSX)",
+        "Implement a strict Content-Security-Policy header",
+        "Use HttpOnly and Secure flags on all session cookies",
+        "Validate input on the server side — not just the client side",
+        "Use DOMPurify for any scenarios where HTML rendering is unavoidable"
+      ]
+    },
+    {
+      "vulnerability_type": "Exposed Sensitive Files",
+      "keywords": [".env exposed", ".git exposed", "backup exposed", "config exposed", "phpinfo", "sensitive file"],
+      "immediate_actions": [
+        "Immediately block public access to the identified file via web server configuration",
+        "Rotate any credentials or secrets that may have been exposed",
+        "Check access logs to determine if the file was accessed before discovery"
+      ],
+      "fix_steps": [
+        "Configure web server to deny access to sensitive paths (nginx deny, Apache Deny from all)",
+        "Move configuration files outside the web root directory",
+        "Add sensitive paths to .gitignore and never commit secrets to version control",
+        "Use environment variables instead of config files for secrets",
+        "Implement periodic automated scans for exposed sensitive files",
+        "Configure a 404 response (not 403) to avoid confirming path existence"
+      ],
+      "nginx_config": "location ~ /\\. { deny all; return 404; }"
+    },
+    {
+      "vulnerability_type": "Missing Security Headers",
+      "keywords": ["missing CSP", "missing HSTS", "missing X-Frame-Options", "security headers", "HSTS not configured"],
+      "immediate_actions": [
+        "Add security headers to your web server or application configuration immediately",
+        "Test headers using securityheaders.com after implementation"
+      ],
+      "fix_steps": [
+        "Add HSTS: Strict-Transport-Security: max-age=31536000; includeSubDomains",
+        "Add CSP: Start with Content-Security-Policy: default-src 'self'",
+        "Add X-Frame-Options: DENY",
+        "Add X-Content-Type-Options: nosniff",
+        "Add Referrer-Policy: strict-origin-when-cross-origin",
+        "Remove Server and X-Powered-By headers",
+        "Use securityheaders.com to validate your implementation"
+      ],
+      "nginx_snippet": "add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;\nadd_header Content-Security-Policy \"default-src 'self'\" always;\nadd_header X-Frame-Options \"DENY\" always;\nadd_header X-Content-Type-Options \"nosniff\" always;"
+    },
+    {
+      "vulnerability_type": "Weak SSL/TLS Configuration",
+      "keywords": ["TLS 1.0", "TLS 1.1", "weak cipher", "SSL expired", "self-signed certificate", "weak TLS", "SSL misconfiguration"],
+      "immediate_actions": [
+        "Identify which TLS versions and cipher suites are currently supported",
+        "Disable TLS 1.0 and TLS 1.1 at the server configuration level"
+      ],
+      "fix_steps": [
+        "Enable only TLS 1.2 and TLS 1.3 in your web server configuration",
+        "Disable weak cipher suites (RC4, DES, 3DES, MD5-based ciphers)",
+        "Use strong cipher suites: ECDHE-RSA-AES256-GCM-SHA384, ECDHE-RSA-AES128-GCM-SHA256",
+        "Enable HSTS to force HTTPS on all connections",
+        "Use certificates from trusted CAs (Let's Encrypt is free and trusted)",
+        "Validate configuration using SSL Labs (ssllabs.com/ssltest) — aim for A+ grade",
+        "Enable OCSP stapling for improved certificate validation performance"
+      ],
+      "nginx_snippet": "ssl_protocols TLSv1.2 TLSv1.3;\nssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;\nssl_prefer_server_ciphers off;"
+    },
+    {
+      "vulnerability_type": "Open Dangerous Ports",
+      "keywords": ["RDP exposed", "SSH exposed", "database port exposed", "Telnet", "FTP exposed", "SMB exposed", "open port"],
+      "immediate_actions": [
+        "Block the dangerous port at the firewall immediately",
+        "Review access logs for unauthorized connection attempts",
+        "Check if the service has default credentials"
+      ],
+      "fix_steps": [
+        "Apply firewall rules to restrict port access to known IP ranges only",
+        "Move administrative services (RDP, SSH) behind a VPN",
+        "Disable Telnet and FTP — replace with SSH and SFTP respectively",
+        "Bind database services to localhost only (listen_addresses = localhost)",
+        "Enable fail2ban or equivalent brute-force protection on SSH",
+        "Disable root SSH login and enforce key-based authentication only",
+        "Regularly audit open ports: nmap -sV your-server.com"
+      ]
+    },
+    {
+      "vulnerability_type": "Missing SPF/DKIM/DMARC",
+      "keywords": ["SPF missing", "DKIM missing", "DMARC missing", "email security", "domain spoofing"],
+      "immediate_actions": [
+        "Begin with DMARC in monitoring mode (p=none) to assess current email flows"
+      ],
+      "fix_steps": [
+        "Create SPF record: v=spf1 include:_spf.google.com ~all (adjust for your email provider)",
+        "Set up DKIM signing with your email provider and add the public key DNS record",
+        "Add DMARC record: _dmarc.example.com TXT 'v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com'",
+        "Gradually move DMARC policy from none -> quarantine -> reject",
+        "Monitor DMARC reports for legitimate sources that need SPF/DKIM alignment",
+        "Use dmarcian.com or Google Postmaster Tools to analyze reports"
+      ]
+    },
+    {
+      "vulnerability_type": "Outdated Software / Known CVE",
+      "keywords": ["outdated", "CVE", "known vulnerability", "unpatched", "end of life", "EoL"],
+      "immediate_actions": [
+        "Identify the exact CVE and assess exploitability against your configuration",
+        "Check if a patch or workaround is available from the vendor",
+        "Apply virtual patching via WAF if an official patch is not yet available"
+      ],
+      "fix_steps": [
+        "Update the affected software to the latest patched version immediately",
+        "Subscribe to vendor security advisories for proactive notification",
+        "Implement automated dependency scanning in your CI/CD pipeline (Dependabot, Snyk)",
+        "Create a patch management SLA: Critical CVEs patched within 24h, High within 7 days",
+        "If immediate update is not possible, apply compensating controls (firewall rules, WAF)"
+      ]
+    },
+    {
+      "vulnerability_type": "Zone Transfer (AXFR) Vulnerability",
+      "keywords": ["zone transfer", "AXFR", "DNS zone transfer", "DNS misconfiguration"],
+      "immediate_actions": [
+        "Restrict DNS zone transfers to authorized secondary servers only"
+      ],
+      "fix_steps": [
+        "In BIND: add allow-transfer { <secondary-server-IP>; }; to zone configuration",
+        "In Windows DNS Server: set zone transfer permissions to named servers only",
+        "Verify fix: dig axfr @your-dns-server example.com (should fail or return REFUSED)",
+        "Audit all publicly resolvable DNS records for sensitive hostname disclosure"
+      ]
+    }
+  ]
+}

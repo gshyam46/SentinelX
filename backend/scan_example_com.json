@@ -1,0 +1,80 @@
+{
+  "domain": "example.com",
+  "findings": [
+    {
+      "severity": "high",
+      "title": "Missing HSTS (HTTP Strict Transport Security)",
+      "description": "Without HSTS, browsers may connect over insecure HTTP first, allowing man-in-the-middle attackers to intercept or downgrade the connection. This enables session hijacking and credential theft.",
+      "remediation": "Add header: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
+      "category": "http_headers"
+    },
+    {
+      "severity": "medium",
+      "title": "Missing Content Security Policy (CSP)",
+      "description": "Without CSP, the browser has no restrictions on what scripts, styles, and resources can load. This significantly increases the attack surface for XSS attacks.",
+      "remediation": "Add a Content-Security-Policy header. Start with:\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'",
+      "category": "http_headers"
+    },
+    {
+      "severity": "medium",
+      "title": "Missing X-Frame-Options (Clickjacking Protection)",
+      "description": "The page can be embedded in iframes on other sites. Attackers can overlay invisible UI on top of your page to trick users into clicking buttons they didn't intend to (clickjacking).",
+      "remediation": "Add header: X-Frame-Options: DENY (or SAMEORIGIN if iframes are needed)",
+      "category": "http_headers"
+    },
+    {
+      "severity": "low",
+      "title": "Missing X-Content-Type-Options",
+      "description": "Without 'nosniff', browsers may MIME-sniff response content. This can allow attackers to trick the browser into treating uploaded files as executable scripts.",
+      "remediation": "Add header: X-Content-Type-Options: nosniff",
+      "category": "http_headers"
+    },
+    {
+      "severity": "low",
+      "title": "Missing Permissions-Policy",
+      "description": "No Permissions-Policy (formerly Feature-Policy) is set. Sensitive browser features like camera, microphone, and geolocation are not restricted.",
+      "remediation": "Add header: Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()",
+      "category": "http_headers"
+    },
+    {
+      "severity": "low",
+      "title": "Missing Referrer-Policy",
+      "description": "Without a Referrer-Policy, the full URL (potentially including sensitive query parameters) may be leaked to third-party sites via the Referer header.",
+      "remediation": "Add header: Referrer-Policy: strict-origin-when-cross-origin",
+      "category": "http_headers"
+    },
+    {
+      "severity": "info",
+      "title": "Missing X-XSS-Protection",
+      "description": "While largely superseded by CSP, X-XSS-Protection provides a fallback for older browsers that don't support CSP.",
+      "remediation": "Add header: X-XSS-Protection: 1; mode=block",
+      "category": "http_headers"
+    },
+    {
+      "severity": "low",
+      "title": "Server Version Disclosed: cloudflare",
+      "description": "The Server header reveals 'cloudflare'. Attackers use this to find known vulnerabilities for the specific server software and version.",
+      "remediation": "Remove or obfuscate the Server header in your web server configuration.",
+      "category": "information_disclosure"
+    },
+    {
+      "severity": "medium",
+      "title": "HTTP Does Not Redirect to HTTPS",
+      "description": "The HTTP version of the site does not redirect to HTTPS. Users who type the URL without 'https://' will connect insecurely.",
+      "remediation": "Configure a 301 redirect from HTTP to HTTPS on your web server.",
+      "category": "http_headers"
+    }
+  ],
+  "summary": {
+    "total": 9,
+    "risk_score": 51,
+    "risk_level": "HIGH",
+    "severity_counts": {
+      "critical": 0,
+      "high": 1,
+      "medium": 3,
+      "low": 4,
+      "info": 1
+    }
+  }
+}

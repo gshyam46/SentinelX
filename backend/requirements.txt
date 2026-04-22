@@ -1,0 +1,47 @@
+# ===== Core Framework =====
+fastapi[standard]>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# ===== Database =====
+sqlalchemy[asyncio]>=2.0.35
+asyncpg>=0.30.0
+alembic>=1.14.0
+
+# ===== Configuration =====
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.0
+
+# ===== Auth =====
+passlib[bcrypt]>=1.7.4
+python-jose[cryptography]>=3.3.0
+
+# ===== HTTP / Networking =====
+httpx>=0.28.0
+dnspython>=2.7.0
+requests>=2.32.0
+
+# ===== Security Tools =====
+# NOTE: nmap_scanner.py uses subprocess directly (no python-nmap needed)
+# Linux Production: install nmap + nuclei as system binaries
+# sudo apt-get install nmap && go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+shodan>=1.31.0
+
+# ===== Task Queue =====
+celery[redis]>=5.4.0
+
+# ===== AI / LLM =====
+litellm>=1.50.0
+
+# ===== RAG (Phase 2 — uncomment when upgrading from keyword to vector search) =====
+# faiss-cpu>=1.9.0
+# sentence-transformers>=3.3.0
+
+# ===== Report Generation =====
+reportlab>=4.2.0
+jinja2>=3.1.4
+
+# ===== Testing =====
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
+httpx  # for TestClient
