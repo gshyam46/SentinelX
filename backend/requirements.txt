@@ -29,6 +29,8 @@ shodan>=1.31.0
 
 # ===== Task Queue =====
 celery[redis]>=5.4.0
+redis>=5.0.0           # sync redis client (used in Celery workers for pub/sub)
+websockets>=13.0       # required by FastAPI WebSocket endpoints
 
 # ===== AI / LLM =====
 litellm>=1.50.0
