@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     HIBP_API_KEY: str = ""
     OTX_API_KEY: str = ""
 
+    # --- Dev / Mock ---
+    MOCK_MODE: bool = False  # Set True on Windows — tool wrappers return structured fake JSON
+
     # --- Rate Limits ---
     MAX_FREE_SCANS_PER_DAY: int = 3
 

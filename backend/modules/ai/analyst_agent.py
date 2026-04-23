@@ -3,43 +3,51 @@ SentinelX — Agent 2: Analyst Agent (LLM + RAG)
 Controlled AI interpretation layer for security findings.
 
 Role:
-  This agent ONLY interprets and explains findings produced by the Tools Layer.
-  It does NOT execute tools, modify scan pipelines, or make security decisions.
+  Interprets findings from the scan pipeline. Does NOT execute tools,
+  modify scan pipelines, or make security decisions.
 
-Input:   Structured findings JSON from the scan pipeline + RAG context
-Output:  Risk summary, severity reasoning, attack context, top risks
+Output: Full AnalysisReport schema — single source of truth for what
+        analyst_tasks.py persists to DB and remediation agent reads.
 
-Boundaries (hard-coded, not configurable by LLM):
+Research fields in output:
+  rag_context_used  — whether RAG returned non-empty context
+  retrieval_method  — "faiss" | "keyword" | "none"
+  model_used        — LiteLLM model string
+
+Boundaries (hard-coded, not LLM-configurable):
   - Cannot trigger tool execution
   - Cannot modify finding data
-  - Must return structured JSON output only
-  - Has a strict token budget (3000 tokens context + 1000 tokens output)
+  - Must return structured JSON output
+  - Token budget: 3000 context + 1200 output
 """
+
+from __future__ import annotations
 
 import json
 import logging
-import os
+import re
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from backend.modules.ai.rag_engine import get_rag_engine
 
 logger = logging.getLogger("sentinelx.analyst")
 
-# Maximum findings to include in context (to keep prompts manageable)
 _MAX_FINDINGS_IN_PROMPT = 15
-
-# LLM call budget — protects against runaway costs
 _MAX_CONTEXT_TOKENS = 3000
 _MAX_OUTPUT_TOKENS = 1200
+
+# OWASP categories for coverage scoring
+_ALL_OWASP = {f"A{i:02d}" for i in range(1, 11)}
 
 
 class AnalystAgent:
     """
     Agent 2 — LLM-powered finding interpreter.
 
-    Uses LiteLLM for provider-agnostic LLM calls.
+    Uses LiteLLM via LiteLLM abstraction (Groq / OpenAI / Anthropic switchable).
     Queries RAG for contextual knowledge before calling the LLM.
-    Output is strictly bounded and structured.
+    Output always conforms to the full AnalysisReport schema.
     """
 
     def __init__(self):
@@ -47,268 +55,345 @@ class AnalystAgent:
 
     async def analyze(self, scan_results: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Analyze scan findings and produce a structured AI interpretation.
+        Analyze scan findings and produce a structured AnalysisReport.
 
         Args:
-            scan_results: Full scan results dict from active_scan.py or passive_recon.py
+            scan_results: {
+                "domain": str,
+                "all_findings": list[dict],
+                "summary": {
+                    "risk_score": int,
+                    "risk_level": str,
+                    "total_findings": int,
+                    "severity_counts": dict,
+                }
+            }
 
         Returns:
-            Structured analysis dict with risk_summary, top_risks, severity_reasoning
+            Full AnalysisReport dict (see _empty_report for schema).
         """
         domain = scan_results.get("domain", "Unknown")
         all_findings = scan_results.get("all_findings", [])
         summary = scan_results.get("summary", {})
 
         logger.info(
-            f"[Analyst] Analyzing {len(all_findings)} findings for {domain} "
-            f"(risk score: {summary.get('risk_score', 0)}/100)"
+            "[Analyst] Analyzing %d findings for %s",
+            len(all_findings), domain,
         )
 
         if not all_findings:
-            logger.info("[Analyst] No findings to analyze")
-            return self._empty_analysis(domain)
+            return self._empty_report(domain)
 
-        # 1. Retrieve RAG context for these findings
-        critical_and_high = [
-            f for f in all_findings
-            if f.get("severity") in ("critical", "high")
+        # 1. RAG retrieval — prioritise critical/high findings for context
+        priority_findings = [
+            f for f in all_findings if f.get("severity") in ("critical", "high")
         ][:_MAX_FINDINGS_IN_PROMPT]
 
-        context = self._rag.query(critical_and_high or all_findings[:10])
-        rag_context = self._rag.format_context_for_prompt(context, max_chars=2000)
+        context = self._rag.query(priority_findings or all_findings[:10])
+        rag_text = self._rag.format_context_for_prompt(context, max_chars=2000)
+        rag_used = bool(rag_text.strip())
+        retrieval_method = self._rag.get_retrieval_method()
 
-        # 2. Build prompt (structured, LLM cannot deviate from output format)
-        prompt = self._build_analysis_prompt(domain, all_findings, summary, rag_context)
+        # 2. Build prompt
+        prompt = self._build_prompt(domain, all_findings, summary, rag_text)
 
-        # 3. Call LLM
-        raw_response = await self._call_llm(prompt)
+        # 3. LLM call
+        raw = await self._call_llm(prompt)
 
-        # 4. Parse and validate response
-        analysis = self._parse_llm_response(raw_response, domain, summary)
+        # 4. Parse + validate
+        report = self._parse_response(raw, domain, summary, all_findings)
 
-        logger.info(f"[Analyst] Analysis complete for {domain}")
-        return analysis
+        # 5. Stamp research metadata
+        report["rag_context_used"] = rag_used
+        report["retrieval_method"] = retrieval_method
 
-    def _build_analysis_prompt(
+        logger.info("[Analyst] Analysis complete for %s — risk_score=%s", domain, report.get("risk_score"))
+        return report
+
+    # ------------------------------------------------------------------
+    # Prompt construction
+    # ------------------------------------------------------------------
+
+    _SYSTEM_PROMPT = """\
+You are a senior penetration tester reviewing automated scan results for a client.
+Your role is STRICTLY LIMITED to interpreting and explaining the provided findings.
+You must NOT suggest running additional tools or modifying the scan process.
+
+Respond with valid JSON only — no prose, no markdown fences, no extra text.
+
+Output schema (all fields required):
+{
+  "executive_summary": "<2-3 sentences for a non-technical stakeholder>",
+  "risk_score": <integer 0-100>,
+  "attack_chains": [
+    {"name": "<chain name>", "steps": ["<finding title>", ...], "impact": "high|medium|low"}
+  ],
+  "owasp_coverage": {
+    "A01": "covered|partial|missing", "A02": "covered|partial|missing",
+    "A03": "covered|partial|missing", "A04": "covered|partial|missing",
+    "A05": "covered|partial|missing", "A06": "covered|partial|missing",
+    "A07": "covered|partial|missing", "A08": "covered|partial|missing",
+    "A09": "covered|partial|missing", "A10": "covered|partial|missing"
+  },
+  "critical_findings": ["<title of top critical/high finding>"],
+  "remediation_priorities": [
+    {"priority": 1, "finding": "<title>", "action": "<concrete fix>", "effort": "low|medium|high"}
+  ],
+  "analyst_notes": "<anything else the team should know, 2-3 sentences>",
+  "top_risks": [
+    {
+      "title": "<finding title>",
+      "severity": "critical|high|medium|low",
+      "attack_context": "<how an attacker exploits this, 1-2 sentences>",
+      "business_impact": "<what business harm results, 1 sentence>"
+    }
+  ],
+  "key_priorities": ["<Priority action 1>", "<Priority action 2>", "<Priority action 3>"]
+}
+
+Risk score guide: critical findings × 25, high × 10, medium × 4, low × 1. Cap at 100.
+Include top 3-5 findings in top_risks and critical_findings.
+Provide concrete, actionable remediation steps — not generic advice.
+"""
+
+    def _build_prompt(
         self,
         domain: str,
         findings: List[Dict],
         summary: Dict,
-        rag_context: str,
+        rag_text: str,
     ) -> str:
-        """
-        Construct a strictly-bounded analysis prompt.
-        The output format is hard-coded — the LLM must follow it exactly.
-        """
-        # Truncate findings list for prompt
-        findings_for_prompt = self._format_findings_for_prompt(
-            findings[:_MAX_FINDINGS_IN_PROMPT]
-        )
-
+        findings_for_prompt = self._format_findings(findings[:_MAX_FINDINGS_IN_PROMPT])
         severity_counts = summary.get("severity_counts", {})
-        risk_score = summary.get("risk_score", 0)
-        risk_level = summary.get("risk_level", "Unknown")
 
-        prompt = f"""You are a senior cybersecurity analyst reviewing automated scan results.
-Your role is STRICTLY LIMITED to interpreting and explaining the provided findings.
-You must NOT suggest running additional tools or modifying the scan process.
-
-TARGET: {domain}
-RISK SCORE: {risk_score}/100 ({risk_level})
-SEVERITY DISTRIBUTION: Critical={severity_counts.get('critical', 0)}, High={severity_counts.get('high', 0)}, Medium={severity_counts.get('medium', 0)}, Low={severity_counts.get('low', 0)}, Info={severity_counts.get('info', 0)}
-
-SECURITY KNOWLEDGE CONTEXT:
-{rag_context}
-
-SCAN FINDINGS:
-{findings_for_prompt}
-
-Provide your analysis as valid JSON matching EXACTLY this structure:
-{{
-  "risk_summary": "2-3 sentence executive summary of the overall security posture",
-  "top_risks": [
-    {{
-      "title": "finding title",
-      "severity": "critical|high|medium|low",
-      "attack_context": "how an attacker would exploit this (1-2 sentences)",
-      "business_impact": "what business harm results if exploited (1 sentence)"
-    }}
-  ],
-  "severity_reasoning": "Explain why this risk score was assessed at this level (2-3 sentences)",
-  "attack_chain": "If multiple findings can be chained, describe the attack path (or null if not applicable)",
-  "key_priorities": ["Priority action 1", "Priority action 2", "Priority action 3"]
-}}
-
-Rules:
-- Include top 3 findings in top_risks (critical/high priority)
-- Be specific and technical but clear to a non-security audience
-- Do not include any text outside the JSON object
-- Respond with valid JSON only"""
-
-        return prompt
-
-    def _format_findings_for_prompt(self, findings: List[Dict]) -> str:
-        """Format findings list as compact text for prompt injection."""
-        # Sort by severity
-        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-        sorted_findings = sorted(
-            findings,
-            key=lambda f: severity_order.get(f.get("severity", "info"), 4)
+        return (
+            f"TARGET: {domain}\n"
+            f"SEVERITY DISTRIBUTION: "
+            f"Critical={severity_counts.get('critical', 0)}, "
+            f"High={severity_counts.get('high', 0)}, "
+            f"Medium={severity_counts.get('medium', 0)}, "
+            f"Low={severity_counts.get('low', 0)}\n\n"
+            f"SECURITY KNOWLEDGE CONTEXT:\n{rag_text or '(none)'}\n\n"
+            f"SCAN FINDINGS:\n{findings_for_prompt}\n\n"
+            "Produce the AnalysisReport JSON."
         )
 
+    @staticmethod
+    def _format_findings(findings: List[Dict]) -> str:
+        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        sorted_f = sorted(findings, key=lambda f: sev_order.get(f.get("severity", "info"), 4))
         lines = []
-        for i, f in enumerate(sorted_findings, 1):
+        for i, f in enumerate(sorted_f, 1):
             sev = f.get("severity", "info").upper()
             title = f.get("title", "Unknown")
             desc = (f.get("description") or "")[:150]
             target = f.get("target", "")
-            lines.append(f"{i}. [{sev}] {title} | Target: {target} | {desc}")
-
+            lines.append(f"{i}. [{sev}] {title} | {target} | {desc}")
         return "\n".join(lines)
 
-    def _parse_llm_response(
+    # ------------------------------------------------------------------
+    # LLM call
+    # ------------------------------------------------------------------
+
+    async def _call_llm(self, prompt: str) -> Optional[str]:
+        try:
+            import litellm
+            from backend.config import get_settings
+
+            settings = get_settings()
+            response = await litellm.acompletion(
+                model=settings.LITELLM_MODEL,
+                messages=[
+                    {"role": "system", "content": self._SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=_MAX_OUTPUT_TOKENS,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            return response.choices[0].message.content
+
+        except ImportError:
+            logger.warning("[Analyst] litellm not installed — using mock response")
+            return self._mock_response()
+        except Exception as exc:
+            logger.error("[Analyst] LLM call failed: %s", exc)
+            return None
+
+    def _mock_response(self) -> str:
+        return json.dumps({
+            "executive_summary": (
+                "Mock analysis — configure GROQ_API_KEY or another LLM provider in .env "
+                "for real AI-powered analysis. The scan detected several security concerns."
+            ),
+            "risk_score": 0,
+            "attack_chains": [],
+            "owasp_coverage": {cat: "missing" for cat in sorted(_ALL_OWASP)},
+            "critical_findings": [],
+            "remediation_priorities": [],
+            "analyst_notes": "Set GROQ_API_KEY in .env and restart for real AI analysis.",
+            "top_risks": [{
+                "title": "LLM Not Configured",
+                "severity": "info",
+                "attack_context": "AI analysis requires an LLM API key.",
+                "business_impact": "Findings are reported but lack AI-generated context.",
+            }],
+            "key_priorities": [
+                "Configure GROQ_API_KEY in .env",
+                "Restart backend server",
+                "Re-run scan for AI-powered analysis",
+            ],
+        })
+
+    # ------------------------------------------------------------------
+    # Response parsing
+    # ------------------------------------------------------------------
+
+    def _parse_response(
         self,
-        raw_response: str,
+        raw: Optional[str],
         domain: str,
         summary: Dict,
+        findings: List[Dict],
     ) -> Dict[str, Any]:
-        """Parse and validate LLM JSON response. Falls back to structured default on error."""
-        if not raw_response:
-            return self._fallback_analysis(domain, summary)
+        if not raw:
+            return self._fallback_report(domain, summary, findings)
 
-        # Extract JSON from response (handles cases where LLM adds prose around it)
-        json_str = raw_response.strip()
+        json_str = raw.strip()
         if "```" in json_str:
-            # Strip code blocks
-            import re
             match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", json_str)
             if match:
                 json_str = match.group(1)
 
         try:
             parsed = json.loads(json_str)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("[Analyst] JSON parse error: %s", exc)
+            return self._fallback_report(domain, summary, findings)
 
-            # Validate required fields
-            required = ["risk_summary", "top_risks", "severity_reasoning", "key_priorities"]
-            for field in required:
-                if field not in parsed:
-                    logger.warning(f"[Analyst] LLM response missing field: {field}")
-                    parsed[field] = self._default_value(field, summary)
+        # Normalize field names (handle old schema → new schema transition)
+        if "executive_summary" not in parsed and "risk_summary" in parsed:
+            parsed["executive_summary"] = parsed.pop("risk_summary")
+        if "analyst_notes" not in parsed and "severity_reasoning" in parsed:
+            parsed["analyst_notes"] = parsed.pop("severity_reasoning")
+        if "attack_chains" not in parsed and "attack_chain" in parsed:
+            chain = parsed.pop("attack_chain")
+            parsed["attack_chains"] = [{"name": "Primary chain", "steps": [chain], "impact": "high"}] if chain else []
 
-            # Ensure top_risks is capped at 5
-            if isinstance(parsed.get("top_risks"), list):
-                parsed["top_risks"] = parsed["top_risks"][:5]
+        # Ensure all required fields
+        defaults = self._fallback_report(domain, summary, findings)
+        for key, default_val in defaults.items():
+            if key not in parsed or parsed[key] is None:
+                parsed[key] = default_val
 
-            parsed["domain"] = domain
-            parsed["ai_generated"] = True
-            return parsed
+        # Clamp risk_score
+        parsed["risk_score"] = max(0, min(100, int(parsed.get("risk_score", 0))))
+        parsed["domain"] = domain
+        parsed["ai_generated"] = True
+        return parsed
 
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"[Analyst] Failed to parse LLM JSON response: {e}")
-            return self._fallback_analysis(domain, summary)
+    # ------------------------------------------------------------------
+    # Fallback / empty reports (full schema always)
+    # ------------------------------------------------------------------
 
-    async def _call_llm(self, prompt: str) -> Optional[str]:
-        """
-        Call the configured LLM via LiteLLM.
-        Returns raw string response or None on failure.
-        """
-        try:
-            import litellm
-            from backend.config import get_settings
+    def _fallback_report(
+        self, domain: str, summary: Dict, findings: List[Dict]
+    ) -> Dict[str, Any]:
+        from backend.config import get_settings
+        settings = get_settings()
 
-            settings = get_settings()
-            model = settings.LITELLM_MODEL
+        counts: Counter = Counter(f.get("severity", "info") for f in findings)
+        risk = min(
+            100,
+            counts["critical"] * 25 + counts["high"] * 10 + counts["medium"] * 4 + counts["low"] * 1,
+        )
+        owasp_seen: set[str] = set()
+        for f in findings:
+            owasp_seen.update(f.get("owasp_categories", []))
+        owasp_coverage = {
+            cat: ("covered" if cat in owasp_seen else "missing")
+            for cat in sorted(_ALL_OWASP)
+        }
+        critical_titles = [f.get("title", "?") for f in findings if f.get("severity") == "critical"][:5]
+        high_titles = [f.get("title", "?") for f in findings if f.get("severity") == "high"][:5]
 
-            logger.debug(f"[Analyst] Calling LLM: {model}")
-
-            response = await litellm.acompletion(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=_MAX_OUTPUT_TOKENS,
-                temperature=0.2,  # Low temperature for deterministic, factual output
-            )
-
-            return response.choices[0].message.content
-
-        except ImportError:
-            logger.warning("[Analyst] litellm not installed — using mock response")
-            return self._mock_llm_response()
-        except Exception as e:
-            logger.error(f"[Analyst] LLM call failed: {e}")
-            return None
-
-    def _mock_llm_response(self) -> str:
-        """Return a mock response for development environments without an LLM configured."""
-        return json.dumps({
-            "risk_summary": "This is a mock analysis response. Configure GROQ_API_KEY or another LLM provider in .env to enable real AI analysis. The scan has detected several security concerns that require attention.",
+        return {
+            "executive_summary": (
+                f"Automated scan of {domain} found {len(findings)} findings "
+                f"({counts['critical']} critical, {counts['high']} high). "
+                "LLM analysis unavailable — rule-based fallback report generated."
+            ),
+            "risk_score": risk,
+            "attack_chains": [],
+            "owasp_coverage": owasp_coverage,
+            "critical_findings": (critical_titles + high_titles)[:10],
+            "remediation_priorities": [
+                {
+                    "priority": i + 1,
+                    "finding": title,
+                    "action": "Investigate and remediate promptly.",
+                    "effort": "medium",
+                }
+                for i, title in enumerate((critical_titles + high_titles)[:5])
+            ],
+            "analyst_notes": (
+                f"Risk score {risk}/100 — weighted: critical×25, high×10, medium×4, low×1. "
+                "Manual analyst review recommended."
+            ),
             "top_risks": [
                 {
-                    "title": "Mock: LLM Not Configured",
-                    "severity": "info",
-                    "attack_context": "Real AI analysis requires an LLM API key configured in the .env file.",
-                    "business_impact": "Without AI analysis, findings are still reported but lack contextual interpretation."
+                    "title": f.get("title", "?"),
+                    "severity": f.get("severity", "info"),
+                    "attack_context": f.get("description", "")[:200],
+                    "business_impact": "Potential data breach or service disruption.",
                 }
+                for f in sorted(
+                    findings,
+                    key=lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}.get(
+                        x.get("severity", "info"), 4
+                    ),
+                )[:3]
             ],
-            "severity_reasoning": "Mock analysis mode. Set GROQ_API_KEY in .env and restart the server for real AI-powered analysis.",
-            "attack_chain": None,
             "key_priorities": [
-                "Configure GROQ_API_KEY in .env file",
-                "Restart the backend server",
-                "Re-run the scan for AI-powered analysis"
-            ]
-        })
-
-    def _empty_analysis(self, domain: str) -> Dict[str, Any]:
-        """Return structured empty analysis when no findings exist."""
-        return {
+                "Remediate all critical findings immediately",
+                "Address high severity findings within 7 days",
+                "Review medium severity findings within 30 days",
+            ],
             "domain": domain,
-            "risk_summary": f"No vulnerabilities were detected for {domain} during this scan. The target appears to have a minimal attack surface based on the scan parameters used.",
-            "top_risks": [],
-            "severity_reasoning": "Risk score is minimal as no exploitable vulnerabilities were detected.",
-            "attack_chain": None,
-            "key_priorities": [
-                "Continue regular scanning as the attack surface evolves",
-                "Monitor for newly disclosed CVEs affecting detected technologies",
-                "Consider expanding scan scope for more comprehensive coverage"
-            ],
-            "ai_generated": True,
+            "ai_generated": False,
+            "rag_context_used": False,
+            "retrieval_method": self._rag.get_retrieval_method(),
+            "model_used": getattr(get_settings(), "LITELLM_MODEL", "rule_based_fallback"),
         }
 
-    def _fallback_analysis(self, domain: str, summary: Dict) -> Dict[str, Any]:
-        """Rule-based fallback when LLM is unavailable or fails."""
-        risk_score = summary.get("risk_score", 0)
-        risk_level = summary.get("risk_level", "Unknown")
-        counts = summary.get("severity_counts", {})
-
+    def _empty_report(self, domain: str) -> Dict[str, Any]:
+        from backend.config import get_settings
         return {
-            "domain": domain,
-            "risk_summary": (
-                f"{domain} has an overall risk score of {risk_score}/100 ({risk_level}). "
-                f"The scan identified {counts.get('critical', 0)} critical, "
-                f"{counts.get('high', 0)} high, and {counts.get('medium', 0)} medium severity issues. "
-                "AI narrative analysis was unavailable — see finding details for remediation guidance."
+            "executive_summary": (
+                f"No vulnerabilities detected for {domain} during this scan. "
+                "The target appears to have a minimal attack surface based on the scan parameters."
+            ),
+            "risk_score": 0,
+            "attack_chains": [],
+            "owasp_coverage": {cat: "missing" for cat in sorted(_ALL_OWASP)},
+            "critical_findings": [],
+            "remediation_priorities": [],
+            "analyst_notes": (
+                "Risk score is minimal as no exploitable vulnerabilities were detected. "
+                "Continue regular scanning as the attack surface evolves."
             ),
             "top_risks": [],
-            "severity_reasoning": f"Risk score of {risk_score}/100 based on weighted severity counts: critical×25, high×15, medium×8, low×3.",
-            "attack_chain": None,
             "key_priorities": [
-                "Prioritize remediation of all critical findings immediately",
-                "Address high severity findings within 7 days",
-                "Review medium severity findings within 30 days"
+                "Continue regular scanning as attack surface evolves",
+                "Monitor for newly disclosed CVEs affecting detected technologies",
+                "Consider expanding scan scope for more comprehensive coverage",
             ],
-            "ai_generated": False,
+            "domain": domain,
+            "ai_generated": True,
+            "rag_context_used": False,
+            "retrieval_method": self._rag.get_retrieval_method(),
+            "model_used": getattr(get_settings(), "LITELLM_MODEL", "unknown"),
         }
-
-    def _default_value(self, field: str, summary: Dict) -> Any:
-        """Provide default values for missing LLM response fields."""
-        defaults = {
-            "risk_summary": "Analysis incomplete — see findings table for details.",
-            "top_risks": [],
-            "severity_reasoning": f"Risk score: {summary.get('risk_score', 0)}/100",
-            "key_priorities": ["Review all critical and high findings immediately"],
-            "attack_chain": None,
-        }
-        return defaults.get(field, None)
 
 
 # Module-level singleton
@@ -324,6 +409,6 @@ def get_analyst_agent() -> AnalystAgent:
 
 
 async def analyze_findings(scan_results: Dict[str, Any]) -> Dict[str, Any]:
-    """Entry-point helper for Agent 2."""
+    """Entry-point helper for Agent 2. Called by analyst_tasks.py."""
     agent = get_analyst_agent()
     return await agent.analyze(scan_results)

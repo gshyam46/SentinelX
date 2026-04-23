@@ -26,6 +26,22 @@ logger = logging.getLogger("sentinelx.workers.scan")
 settings = get_settings()
 
 # ---------------------------------------------------------------------------
+# Tier-based scan parameters (lives here, not in the orchestrator)
+# ---------------------------------------------------------------------------
+
+_TIER_BUDGETS: dict[str, int] = {"free": 8, "pro": 30}
+_PRO_ONLY_TOOLS = {"sqlmap_scan", "dalfox_scan", "feroxbuster"}
+
+
+def _scan_params_for_tier(tier: str) -> tuple[int, list[str]]:
+    """Return (budget, allowed_tools) for the given tier string."""
+    from backend.agents.orchestrator import TOOL_REGISTRY
+    budget = _TIER_BUDGETS.get(tier, _TIER_BUDGETS["free"])
+    is_pro = tier in ("pro", "paid", "enterprise")
+    allowed = [name for name in TOOL_REGISTRY if is_pro or name not in _PRO_ONLY_TOOLS]
+    return budget, allowed
+
+# ---------------------------------------------------------------------------
 # Helpers — synchronous DB writes with automatic 3-retry backoff
 # ---------------------------------------------------------------------------
 
@@ -90,10 +106,6 @@ async def _db_update_tool_started(scan_id: uuid.UUID, tool: str, budget_remainin
         result = await db.execute(select(Scan).where(Scan.id == scan_id))
         scan = result.scalar_one()
         scan.current_step = f"Running: {tool}"
-        # Rough progress from budget consumption
-        from backend.agents.orchestrator import TIER_BUDGETS
-        # We don't have tier here; compute from budget_remaining field compared to results
-        # Simple heuristic: budget_remaining drives the progress bar
         scan.progress = max(0, min(90, 90 - int(budget_remaining * 5)))
         await db.commit()
 
@@ -181,7 +193,8 @@ async def _db_fail_scan(scan_id: uuid.UUID, error: str) -> None:
 async def _run_orchestrator_loop(
     scan_id: uuid.UUID,
     target: str,
-    tier: str,
+    budget: int,
+    allowed_tools: list[str],
     redis_channel: str,
     task_self,  # the bound Celery task for update_state()
 ) -> dict:
@@ -195,7 +208,12 @@ async def _run_orchestrator_loop(
     tools_run: list[str] = []
     scan_metadata: dict = {}
 
-    async for event in run_orchestrator(target=target, tier=tier, scan_id=scan_id):
+    async for event in run_orchestrator(
+        target=target,
+        scan_id=scan_id,
+        budget=budget,
+        allowed_tools=allowed_tools,
+    ):
         event_dict = event.to_dict()
         etype = event.type
 
@@ -306,8 +324,10 @@ def orchestrate_scan(self, scan_id: str, target: str, tier: str) -> dict:
     _scan_id = uuid.UUID(scan_id)
     redis_channel = f"scan:{scan_id}:events"
 
+    budget, allowed_tools = _scan_params_for_tier(tier)
     logger.info(
-        "[%s] orchestrate_scan starting — target=%s tier=%s", scan_id, target, tier
+        "[%s] orchestrate_scan starting — target=%s tier=%s budget=%d tools=%d",
+        scan_id, target, tier, budget, len(allowed_tools),
     )
 
     # Mark scan as running
@@ -322,7 +342,8 @@ def orchestrate_scan(self, scan_id: str, target: str, tier: str) -> dict:
             _run_orchestrator_loop(
                 scan_id=_scan_id,
                 target=target,
-                tier=tier,
+                budget=budget,
+                allowed_tools=allowed_tools,
                 redis_channel=redis_channel,
                 task_self=self,
             )
