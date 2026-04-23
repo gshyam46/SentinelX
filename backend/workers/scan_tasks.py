@@ -218,8 +218,17 @@ async def _db_complete_scan(scan_id: uuid.UUID, metadata: dict, tools_run: list[
         scan.current_step = "Scan complete - running analysis"
         scan.completed_at = datetime.now(timezone.utc)
 
+        # Derive execution_graph_present from metadata before persisting.
+        # This is additive — does not mutate the caller's dict.
+        execution_graph = metadata.get("execution_graph")
+        execution_graph_present = bool(execution_graph)
+        persisted_metadata = {
+            **metadata,
+            "execution_graph_present": execution_graph_present,
+        }
+
         existing = scan.results or {}
-        scan.results = {**existing, "tools_run": tools_run, "scan_metadata": metadata}
+        scan.results = {**existing, "tools_run": tools_run, "scan_metadata": persisted_metadata}
 
         risk = min(
             100,

@@ -12,7 +12,14 @@
 - Upgraded AI layer with FAISS-backed RAG fallback and unified analyst schema
 - Replaced duplicate analyst task logic with `analyze_findings()`
 
-### Session Summary (2026-04-24)
+### Session Summary (2026-04-24 — KB Expansion)
+- Fetched CISA KEV full catalog → `kev_catalog.json` (1,579 entries, richer schema with requiredAction, dueDate, notes)
+- Fetched Exploit-DB full catalog → `exploit_db.json` (48,058 entries: 46,993 exploits + 1,065 shellcodes)
+- Fetching NVD CVEs → `cve_summaries.json` (last 3 years, CVSS ≥ 7.0, ~10 × 120-day windows in progress)
+- Expanded `rag_engine.py`: added kev_catalog / exploit_db / cve_summaries to KB + FAISS index; KEV-priority routing; prompt context blocks for exploit_db and cve_summaries
+- Added `fetch_kev.py`, `fetch_exploitdb.py`, `fetch_cve.py` as one-shot refresh scripts
+- Updated `.gitignore` to exclude large generated files; `kev_catalog.json` (~1.2 MB) is committed
+- Logged ADR-017 in DECISIONS.md
 - Wired `scan_type` and `scan_mode` through the Celery scan boundary
 - `workers/scan_tasks.py` now uses the dedicated passive recon engine for passive scans
 - Active and full scans now flow through `modules/pentest/active_scan.py` with validated deterministic/adaptive mode selection
@@ -37,15 +44,21 @@
 - [x] `orchestrator._execute_tool` - dispatches through `OPERATIONAL_REGISTRY`
 - [x] `nuclei_scanner.py` - MOCK_MODE + `owasp_categories`
 - [x] `nmap_scanner.py` - MOCK_MODE + `owasp_categories`
-- [x] `rag_engine.py` - FAISS primary path with keyword fallback; KEV-enriched query (2026-04-24)
-- [x] `analyst_agent.py` - unified `AnalysisReport` schema + research metadata
-- [x] `analyst_tasks.py` - calls `analyze_findings()` as single source of truth
-- [x] `workers/scan_tasks.py` - `scan_type` + `scan_mode` boundary wiring complete
-- [x] `backend/test_api.py` - isolated integration coverage added and passing
+- [x] `rag_engine.py` - FAISS primary path with keyword fallback; KEV-enriched query; kev_catalog/exploit_db/cve_summaries KB sources wired
+- [x] `analyst_agent.py` - unified `AnalysisReport` schema + research metadata; `kev_matches` stamped onto report; KEV prompt escalation + analyst_notes annotation wired (Step 2 of KEV pipeline complete)
+- [x] `analyst_tasks.py` - calls `analyze_findings()` as single source of truth; persists `kev_matches` as top-level `scan.results` key; emits `kev_matches` in `analyst_complete` Redis event
+- [x] `workers/scan_tasks.py` - `scan_type` + `scan_mode` boundary wiring complete; `execution_graph_present` derived and persisted in `scan_metadata` on scan completion
+- [x] `schemas/scan.py` - `execution_graph_present: bool = False` and `kev_matches: list[str] = []` added to `ScanResultResponse` (backward-compatible defaults)
+- [x] `backend/test_api.py` - isolated integration coverage added and passing (3/3)
 - [x] `execution_graph.py` - causal DAG for tool chaining (36/36 tests passing)
 - [x] `kev_loader.py` - CISA KEV feed loader with 24h cache, fallback, Pydantic schema (31/31 tests passing)
-- [ ] `@reviewer` audit - next priority
-- [ ] ARCHITECTURE.md sync - reflect adaptive orchestrator + Celery reality
+- [x] `kev_catalog.json` - full CISA KEV catalog (1,579 entries, fetch_kev.py)
+- [x] `exploit_db.json` - Exploit-DB full catalog (48,058 entries, fetch_exploitdb.py)
+- [x] `ARCHITECTURE.md` - synced to live adaptive orchestrator + Celery pipeline + execution graph + KEV/RAG architecture
+- [x] `CLAUDE.md` - build status updated to reflect Week 2 completion state
+- [ ] `cve_summaries.json` - NVD CVE fetch in progress (fetch_cve.py, ~10 min)
+- [ ] KEV lifespan pre-warm - wire `await load_kev_entries()` into FastAPI lifespan (`@backend-engineer`)
+- [ ] `@reviewer` audit - full audit of pentest + worker pipeline
 
 ---
 
@@ -70,9 +83,13 @@
 | Active Scan Dispatcher | `modules/pentest/active_scan.py` | deterministic + adaptive execution + execution graph wiring |
 | Operational Tool Registry | `modules/pentest/tool_registry.py` | runnable tools + scan profiles |
 | Execution Graph | `modules/pentest/execution_graph.py` | causal DAG — tool→finding edges, UUID4 nodes, JSON export |
-| RAG Engine | `modules/ai/rag_engine.py` | FAISS + sentence-transformers fallback; KEV-enriched query with kev_matches + kev_alerts |
+| RAG Engine | `modules/ai/rag_engine.py` | FAISS + sentence-transformers fallback; KEV-enriched query with kev_matches + kev_alerts; kev_catalog/exploit_db/cve_summaries KB sources wired |
 | KEV Loader | `modules/ai/knowledge_base/kev_loader.py` | CISA KEV feed, 24h cache, Pydantic KEVEntry, graceful fallback |
-| Analyst Agent | `modules/ai/analyst_agent.py` | full `AnalysisReport` schema + research metadata |
+| KEV Catalog | `modules/ai/knowledge_base/kev_catalog.json` | 1,579 entries, full schema (vulnerability_name, requiredAction, dueDate, notes) |
+| Exploit-DB Catalog | `modules/ai/knowledge_base/exploit_db.json` | 48,058 entries (exploits + shellcodes), gitignored, refresh via fetch_exploitdb.py |
+| CVE Summaries | `modules/ai/knowledge_base/cve_summaries.json` | NVD CVEs last 3y CVSS ≥7, gitignored, refresh via fetch_cve.py |
+| KEV Loader | `modules/ai/knowledge_base/kev_loader.py` | CISA KEV feed, 24h cache, Pydantic KEVEntry, graceful fallback |
+| Analyst Agent | `modules/ai/analyst_agent.py` | full `AnalysisReport` schema + research metadata; KEV escalation in system prompt + analyst_notes annotation |
 | Analyst Task | `workers/analyst_tasks.py` | wired to analyst agent, no duplicate LLM path |
 | Celery Pipeline | `workers/scan_tasks.py`, `workers/analyst_tasks.py` | scan -> analyst -> report |
 | Remediation Agent | `modules/ai/remediation_agent.py` | wired into report generation |
@@ -112,17 +129,18 @@
 ---
 
 ## Known Issues / Blockers
-- [ ] `CLAUDE.md` and `ARCHITECTURE.md` still describe the older fixed/zero-LLM orchestrator in several sections.
 - [ ] `SYNC_DATABASE_URL` in `config.py` is still unused unless Alembic needs it.
-- [ ] Adaptive event metadata is still thinner than deterministic metadata (`tools_selected_by` is not yet present on every adaptive event).
+- [ ] Adaptive event metadata is still thinner than deterministic metadata (`tools_selected_by` is not yet present on every adaptive scan event).
+- [x] `execution_graph_present` now derived and persisted in `scan_metadata` JSONB on scan completion (2026-04-24).
+- [ ] Full `execution_graph` payload (the entire node/edge dict) is not yet stored as its own top-level key in `scan.results` — only `execution_graph_present: bool` is stored in `scan_metadata`. If the full graph needs to be queryable, add it as `scan.results["execution_graph"]` in a follow-up.
+- [ ] KEV cache is not pre-warmed at startup — first scan may call network; `await load_kev_entries()` not yet in FastAPI lifespan.
 
 ---
 
 ## Next 3 Tasks (ordered)
-1. Run `@reviewer` audit on the pentest + worker pipeline changes
-2. Sync `CLAUDE.md` and `ARCHITECTURE.md` to the live adaptive/passive-worker architecture
-3. Store `execution_graph` JSON in the DB scan record (JSONB column) so it persists beyond the Celery event stream
-4. Wire `await load_kev_entries()` into the FastAPI lifespan startup so the KEV cache is pre-populated before first scan
+1. `@backend-engineer` — Step 3: pass `kev_matches` from `rag_engine.query()` result through `analyst_tasks.py` → `analyze_findings(kev_matches=...)` (KEV pipeline final wiring)
+2. `@backend-engineer` — wire `await load_kev_entries()` into FastAPI lifespan for KEV pre-warm (first-scan network latency fix)
+3. `@reviewer` — full audit of pentest + worker pipeline (active_scan, execution_graph, scan_tasks, analyst_tasks, rag_engine)
 
 ---
 _Last updated: 2026-04-24 by Codex_

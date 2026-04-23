@@ -76,6 +76,10 @@ class ScanResultResponse(BaseModel):
     error_message: str | None
     created_at: datetime
     completed_at: datetime | None
+    # Additive metadata fields — default to safe values so old DB records
+    # that pre-date these fields still deserialize without error.
+    execution_graph_present: bool = False
+    kev_matches: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 

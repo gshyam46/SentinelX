@@ -111,5 +111,95 @@ uses the `backend.` prefix convention while isolated test loading uses the bare 
 accepts the same wider type — callers that don't pass `kev_alerts` see no change.
 `kev_cache.json` added to root `.gitignore`. `knowledge_base/__init__.py` created.
 Future: wire `await load_kev_entries()` into FastAPI lifespan for eager cache warm-up.
+## ADR-017: Knowledge Base Expansion — KEV Catalog + Exploit-DB + NVD CVE (2026-04-24)
+**Decision:** Three new knowledge sources added to `modules/ai/knowledge_base/`:
+1. `kev_catalog.json` — full CISA KEV feed (1,579+ entries) with richer schema than `kev_cache.json`:
+   adds `vulnerability_name`, `cvss_score`, `due_date`, `required_action`, `notes`.
+   Fetched by `fetch_kev.py`. Permanent file (not a TTL cache).
+2. `exploit_db.json` — Exploit-DB full catalog (46,993 exploits + 1,065 shellcodes = 48,058 entries)
+   from official GitLab CSVs. Fields: id, description, date_published, author, type, platform,
+   port, verified, codes (CVE/BID links), tags, source. Fetched by `fetch_exploitdb.py`.
+3. `cve_summaries.json` — NVD API v2 CVEs, last 3 years, CVSS ≥ 7.0. Full schema including
+   cvss_vector, attack_vector/complexity/PR/UI/scope, CWE IDs, CPE affected products,
+   references (advisory/PoC/patch links), vendor_comments. Fetched by `fetch_cve.py`.
+
+**RAG wiring (rag_engine.py):**
+- `_KB_FILES` extended with all three new sources (graceful skip if file absent).
+- `_kb_entry_to_text()` extended with text extractors for each source (FAISS indexing).
+- `query()` now: (1) extract CVE IDs → KEV lookup (highest priority) → `kev_matches` + `kev_alerts`;
+  (2) also match kev_catalog.json entries by CVE ID → `kev_catalog` key in result;
+  (3) FAISS / keyword retrieval now also returns `exploit_db` + `cve_summaries` buckets.
+- `format_context_for_prompt()` now renders KEV ALERT → KEV CATALOG DETAIL → OWASP → HEADER
+  → REMEDIATION → EXPLOIT-DB → CVE SUMMARIES (priority order).
+
+**Fetch scripts (one-shot, not at server startup):**
+- `fetch_kev.py` — direct CISA feed; uses `requests` or `urllib` fallback.
+- `fetch_exploitdb.py` — GitLab raw CSV for exploits + shellcodes; UTF-8/latin-1 fallback.
+- `fetch_cve.py` — NVD API v2 with 120-day window chunking (API limit), 1000/page,
+  Z-suffix timestamps, client-side CVSS filtering. Respects 6s rate limit (unauthenticated).
+
+**Constraints:**
+- Large files (`exploit_db.json` ~18 MB, `cve_summaries.json` ~100–300 MB) are gitignored.
+- RAG engine loads all files at startup — exploit_db is large; FAISS indexing of 48k entries
+  is one-time cost at first load. Consider lazy loading or separate index for exploit_db in V2.
+- `kev_catalog` bucket in FAISS is routed into the `owasp` result bucket (shares slot);
+  standalone `kev_catalog` key carries the direct CVE-ID matches.
+
+## ADR-018: Additive Scan Result Metadata — execution_graph_present + kev_matches (2026-04-24)
+**Decision:** Two metadata fields added to the scan results pipeline, additive-only with safe defaults:
+
+1. `execution_graph_present: bool` — derived inside `_db_complete_scan()` from `bool(metadata.get("execution_graph"))`.
+   Stored as a key inside `scan.results["scan_metadata"]`. Does NOT mutate the caller's metadata dict (new dict is built via spread).
+
+2. `kev_matches: list[str]` — extracted from `rag_engine.query()` return value inside `AnalystAgent.analyze()`.
+   Stamped onto the AnalysisReport dict (available to downstream LLM prompt readers via `report["kev_matches"]`).
+   Also promoted to `scan.results["kev_matches"]` (top-level) by `_db_save_ai_report()` so any reader of scan
+   results can access it without parsing `ai_report`.
+   Also emitted in the `analyst_complete` Redis SSE event.
+
+**Schema:** `ScanResultResponse` in `schemas/scan.py` gains both fields with default values
+(`execution_graph_present: bool = False`, `kev_matches: list[str] = []`). Old DB records that lack these
+keys deserialize correctly.
+
+**Constraints:** Zero breaking changes — no existing field renamed or removed. No existing function
+signatures changed. `analyze_findings()` signature unchanged. Test assertion for `result` dict in
+`test_orchestrate_scan_pipeline_runs_requested_mode_end_to_date` unaffected because `execution_graph_present`
+is added to the persisted copy (`persisted_metadata`) not to the `result` dict returned by the worker.
+
+**Consequence:** Downstream consumers (frontend, report generator, reviewer) can now reliably check
+`scan.results["kev_matches"]` and `scan.results["scan_metadata"]["execution_graph_present"]` on any
+completed scan record.
+
+## ADR-019: KEV Escalation in Analyst System Prompt (2026-04-24)
+**Decision:** When `kev_matches` is non-empty, `AnalystAgent._build_system_prompt()` appends
+`_KEV_SYSTEM_PROMPT_BLOCK` to the base `_SYSTEM_PROMPT` (never replaces it). The block
+instructs the LLM to treat KEV CVEs as CRITICAL regardless of CVSS score, include the phrase
+"known exploited in wild", and elevate remediation priority to IMMEDIATE.
+
+After the LLM call, `analyze()` appends a human-readable KEV note to `analyst_notes`
+(additive: `existing_notes + "\n" + kev_note`). Empty existing notes use `kev_note` directly.
+
+`analyze()` and `analyze_findings()` both gain `kev_matches: List[str] = []` with
+empty-list default — all existing callers continue to work without change.
+
+`_call_llm()` gains an optional `system_prompt` parameter (defaults to `_SYSTEM_PROMPT`)
+so the augmented prompt is passed per-call, not stored as mutable class state.
+
+**Rationale:** KEV-confirmed CVEs represent the highest-urgency signal in the analysis.
+The LLM must treat them as CRITICAL at the prompt level, not just because the RAG context
+mentions them. Appending (not replacing) the system prompt preserves all existing output schema
+instructions — the LLM still knows it must emit the full JSON schema. Annotating `analyst_notes`
+gives downstream consumers (report generator, frontend) a human-readable KEV summary without
+requiring a schema field change.
+
+**Constraints:** `AnalysisReport` schema fields NOT changed — no new top-level field added
+by the KEV escalation path. `kev_matches` was already present from ADR-018.
+The `_SYSTEM_PROMPT` class attribute itself is never mutated — `_build_system_prompt()` builds
+a new string and returns it, leaving the class-level constant intact for callers that use it directly.
+
+**Consequence:** Backend-engineer Step 3 must call `analyze_findings(scan_results, kev_matches=kev_ids)`
+where `kev_ids` comes from `context["kev_matches"]` returned by `rag_engine.query()` in `analyst_tasks.py`.
+15 new unit tests added in `backend/modules/ai/test_analyst_agent.py` — all passing.
+
 ---
 _Add new ADRs as decisions are made during build_

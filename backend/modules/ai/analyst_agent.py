@@ -40,6 +40,20 @@ _MAX_OUTPUT_TOKENS = 1200
 # OWASP categories for coverage scoring
 _ALL_OWASP = {f"A{i:02d}" for i in range(1, 11)}
 
+# KEV escalation block appended to system prompt when matches are present.
+# {cve_list} is replaced at call time with newline-joined CVE IDs.
+_KEV_SYSTEM_PROMPT_BLOCK = """\
+
+CRITICAL INTELLIGENCE — KNOWN EXPLOITATION IN THE WILD:
+The following CVE IDs are confirmed in CISA's Known Exploited Vulnerabilities (KEV) catalog,
+meaning they have been actively exploited by threat actors:
+{cve_list}
+
+For any finding related to these CVEs:
+- Severity reasoning MUST treat them as CRITICAL regardless of CVSS score
+- Include the phrase "known exploited in wild" in your analysis for that finding
+- Elevate remediation priority to IMMEDIATE"""
+
 
 class AnalystAgent:
     """
@@ -53,7 +67,11 @@ class AnalystAgent:
     def __init__(self):
         self._rag = get_rag_engine()
 
-    async def analyze(self, scan_results: Dict[str, Any]) -> Dict[str, Any]:
+    async def analyze(
+        self,
+        scan_results: Dict[str, Any],
+        kev_matches: List[str] = [],
+    ) -> Dict[str, Any]:
         """
         Analyze scan findings and produce a structured AnalysisReport.
 
@@ -68,6 +86,10 @@ class AnalystAgent:
                     "severity_counts": dict,
                 }
             }
+            kev_matches: CVE IDs confirmed in CISA KEV catalog. When non-empty
+                         the system prompt is augmented with KEV escalation
+                         instructions and analyst_notes records the matches.
+                         Defaults to [] for full backward compatibility.
 
         Returns:
             Full AnalysisReport dict (see _empty_report for schema).
@@ -94,11 +116,12 @@ class AnalystAgent:
         rag_used = bool(rag_text.strip())
         retrieval_method = self._rag.get_retrieval_method()
 
-        # 2. Build prompt
+        # 2. Build prompt and (optionally) KEV-augmented system prompt
         prompt = self._build_prompt(domain, all_findings, summary, rag_text)
+        system_prompt = self._build_system_prompt(kev_matches)
 
         # 3. LLM call
-        raw = await self._call_llm(prompt)
+        raw = await self._call_llm(prompt, system_prompt=system_prompt)
 
         # 4. Parse + validate
         report = self._parse_response(raw, domain, summary, all_findings)
@@ -106,6 +129,26 @@ class AnalystAgent:
         # 5. Stamp research metadata
         report["rag_context_used"] = rag_used
         report["retrieval_method"] = retrieval_method
+        # kev_matches: CVE IDs from findings that matched the CISA KEV catalog.
+        # Already computed by rag_engine.query(); surface them on the report so
+        # analyst_tasks.py can persist them without re-querying the RAG engine.
+        report["kev_matches"] = context.get("kev_matches", [])
+
+        # 6. Append KEV match record to analyst_notes (additive — never replaces)
+        if kev_matches:
+            kev_note = (
+                f"KEV matches detected: {', '.join(kev_matches)}"
+                " — severity elevated per CISA KEV catalog."
+            )
+            existing_notes = report.get("analyst_notes") or ""
+            report["analyst_notes"] = (
+                f"{existing_notes}\n{kev_note}" if existing_notes else kev_note
+            )
+            logger.info(
+                "[Analyst] KEV escalation applied for %s: %s",
+                domain,
+                ", ".join(kev_matches),
+            )
 
         logger.info("[Analyst] Analysis complete for %s — risk_score=%s", domain, report.get("risk_score"))
         return report
@@ -154,7 +197,16 @@ Output schema (all fields required):
 Risk score guide: critical findings × 25, high × 10, medium × 4, low × 1. Cap at 100.
 Include top 3-5 findings in top_risks and critical_findings.
 Provide concrete, actionable remediation steps — not generic advice.
-"""
+Think step by step but respond only with the JSON schema."""
+
+    def _build_system_prompt(self, kev_matches: List[str]) -> str:
+        """Return system prompt, with KEV escalation block appended when matches exist."""
+        if not kev_matches:
+            return self._SYSTEM_PROMPT
+        kev_block = _KEV_SYSTEM_PROMPT_BLOCK.format(
+            cve_list="\n".join(kev_matches)
+        )
+        return self._SYSTEM_PROMPT + kev_block
 
     def _build_prompt(
         self,
@@ -195,7 +247,21 @@ Provide concrete, actionable remediation steps — not generic advice.
     # LLM call
     # ------------------------------------------------------------------
 
-    async def _call_llm(self, prompt: str) -> Optional[str]:
+    async def _call_llm(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Call the LLM with the user prompt and an optional system prompt override.
+
+        Args:
+            prompt:        User-turn message (findings + RAG context).
+            system_prompt: System prompt string to use. When None (default) the
+                           class-level _SYSTEM_PROMPT is used, preserving
+                           backward compatibility for any direct callers.
+        """
+        resolved_system = system_prompt if system_prompt is not None else self._SYSTEM_PROMPT
         try:
             import litellm
             from backend.config import get_settings
@@ -204,7 +270,7 @@ Provide concrete, actionable remediation steps — not generic advice.
             response = await litellm.acompletion(
                 model=settings.LITELLM_MODEL,
                 messages=[
-                    {"role": "system", "content": self._SYSTEM_PROMPT},
+                    {"role": "system", "content": resolved_system},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=_MAX_OUTPUT_TOKENS,
@@ -364,6 +430,8 @@ Provide concrete, actionable remediation steps — not generic advice.
             "rag_context_used": False,
             "retrieval_method": self._rag.get_retrieval_method(),
             "model_used": getattr(get_settings(), "LITELLM_MODEL", "rule_based_fallback"),
+            # Default empty; populated by analyze() when RAG runs successfully.
+            "kev_matches": [],
         }
 
     def _empty_report(self, domain: str) -> Dict[str, Any]:
@@ -393,6 +461,8 @@ Provide concrete, actionable remediation steps — not generic advice.
             "rag_context_used": False,
             "retrieval_method": self._rag.get_retrieval_method(),
             "model_used": getattr(get_settings(), "LITELLM_MODEL", "unknown"),
+            # No findings means no CVE IDs to match against KEV.
+            "kev_matches": [],
         }
 
 
@@ -408,7 +478,18 @@ def get_analyst_agent() -> AnalystAgent:
     return _analyst_agent
 
 
-async def analyze_findings(scan_results: Dict[str, Any]) -> Dict[str, Any]:
-    """Entry-point helper for Agent 2. Called by analyst_tasks.py."""
+async def analyze_findings(
+    scan_results: Dict[str, Any],
+    kev_matches: List[str] = [],
+) -> Dict[str, Any]:
+    """
+    Entry-point helper for Agent 2. Called by analyst_tasks.py.
+
+    Args:
+        scan_results: Structured findings dict from the scan pipeline.
+        kev_matches:  CVE IDs confirmed in CISA KEV catalog (optional).
+                      Passed through to AnalystAgent.analyze() for prompt
+                      escalation and analyst_notes annotation.
+    """
     agent = get_analyst_agent()
-    return await agent.analyze(scan_results)
+    return await agent.analyze(scan_results, kev_matches=kev_matches)

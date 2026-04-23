@@ -14,35 +14,40 @@
 > **Development Environment:** Windows (local dev, mock mode for native tools)
 > **Production Target:** Linux (Ubuntu 22.04 / Debian-based), where all security tools (Nuclei, Nmap, Gobuster) are pre-installed as system binaries.
 
-The platform follows a **two-layer controlled architecture**:
+The platform follows a **two-layer controlled architecture** with a constrained adaptive orchestrator at the core:
 
-### Layer 1 — Tools Layer (Deterministic Execution)
-Security tools perform all vulnerability detection. **No AI involvement in discovery.**
-- All scanners execute as subprocesses (or async calls)
-- Outputs are structured JSON findings fed into the pipeline
-- Tools: `nuclei`, `nmap`, `gobuster`, passive HTTP/DNS modules
+### Layer 1 — Tools Layer (Deterministic + Constrained Adaptive Execution)
+Security tools perform all vulnerability detection. AI is never allowed to discover vulnerabilities or introduce tools outside the enforced allowlist.
+
+Agent 1 (Orchestrator) operates in two mutually exclusive modes:
+
+**Deterministic mode** — fixed scan profile, no LLM involvement whatsoever. Tools run in the order defined by `SCAN_PROFILES` in `modules/pentest/tool_registry.py`.
+
+**Adaptive mode** — LLM recommends which tool to run next, but only from the Python-enforced `ALLOWED_TOOLS` allowlist derived from `TOOL_REGISTRY` (in `agents/orchestrator.py`). Every LLM recommendation is validated against `OPERATIONAL_REGISTRY` (in `tool_registry.py`) before dispatch. Invalid selections trigger a deterministic rule-based fallback — execution never halts. LLM cannot execute tools, skip steps, add tools outside the registry, or trigger additional scan runs.
+
+All tool execution dispatches through `OPERATIONAL_REGISTRY` in `modules/pentest/tool_registry.py`. No follow-up mini-scans: the LLM has no mechanism to request additional tool runs mid-pipeline.
 
 ### Layer 2 — AI Layer (Controlled Intelligence)
 The AI does **not** discover vulnerabilities. It strictly:
-- Interprets structured findings
-- Prioritizes risks with reasoning
+- Interprets structured tool outputs
+- Prioritizes risks with reasoning enriched by KEV and RAG context
 - Generates remediation guidance
 - Provides executive-level summaries
 
-### Layer 3 — Execution Intelligence (Emerging)
+### Layer 3 — Execution Intelligence (Operational)
 
-SentinelX incrementally builds an internal execution graph during scans:
+SentinelX incrementally builds a causal DAG during every active scan via `modules/pentest/execution_graph.py`:
 
-tool → finding → subsequent tool → verification
+tool_execution → (triggered_by) → finding
 
-This transforms linear scan outputs into causal attack paths.
+This transforms linear scan logs into verifiable attack paths. See Section 9 for full details.
 
 This layer enables:
 - attack chain reconstruction
 - audit-grade evidence trails
 - future automated verification loops (Find → Fix → Verify)
 
-(Currently additive — does not alter execution flow)
+The graph is write-only during execution — additive instrumentation around existing tool calls, no existing logic changed. LLM may read the exported graph but cannot mutate it.
 
 ---
 
@@ -136,30 +141,52 @@ sentinelX/
 
 ---
 
-## 5. Agent Roles (Strictly Defined)
+## 5. Agent Roles and Celery Pipeline (Strictly Defined)
 
-### 🔹 Agent 1 — Orchestrator (Deterministic + Constrained Adaptive Controller)
+### Celery Pipeline (Live Architecture)
 
-- Executes tools via fixed pipelines OR adaptive selection mode
-- In adaptive mode:
-  - LLM recommends next tool from TOOL_REGISTRY
-  - Python validates against OPERATIONAL_REGISTRY
-- Maintains execution state and (future) execution graph
+Celery is the live scan execution pipeline — not a future migration. The full chain:
 
-### 🔹 Agent 2 — Analyst (LLM + RAG)
-**Implementation:** LiteLLM + FAISS RAG
-- **Input:** Structured findings JSON + RAG context
-- **Output:** Vulnerability explanations, severity reasoning, attack context
-- Queries RAG for relevant OWASP/CVE context before calling LLM
-- Prompt is fully structured — LLM cannot modify flow
-- Located: `modules/ai/analyst_agent.py`
+```
+POST /api/v1/scans
+    → scan record created (status=pending)
+    → scan_tasks.orchestrate_scan.delay(scan_id, scan_type, scan_mode)
+        → scan_type="passive"  → modules/recon/passive_recon.py   (free tier)
+        → scan_type="active"|"full"
+             scan_mode="deterministic" → modules/pentest/active_scan._deterministic_scan
+             scan_mode="adaptive"     → modules/pentest/active_scan._adaptive_scan
+    → workers/analyst_tasks.run_analyst (analyze_findings)
+    → generate_report
+    → scan record updated (status=complete, results=JSON)
+```
 
-### 🔹 Agent 3 — Remediation Advisor
-**Implementation:** LiteLLM (structured output)
-- **Input:** Processed findings from Agent 2
-- **Output:** Step-by-step remediation, prioritized fix list
+`workers/scan_tasks.py` is the Celery boundary that carries both `scan_type` and `scan_mode` across the task boundary. Passive scans are guaranteed to avoid active tooling regardless of tier (enforced at the worker, not just the API).
+
+### Agent 1 — Orchestrator (Deterministic + Constrained Adaptive Controller)
+
+**File:** `modules/pentest/active_scan.py` + `agents/orchestrator.py`
+
+- **Deterministic mode:** fixed scan profile sequence from `SCAN_PROFILES`, zero LLM involvement. Execution graph populated as instrumentation.
+- **Adaptive mode:** `OrchestratorAgent` prompts LLM for next-tool recommendation from `TOOL_REGISTRY` catalogue. Every selection validated against `OPERATIONAL_REGISTRY` before dispatch. Rule-based fallback fires on invalid selection. LLM cannot add tools, skip steps, or request additional scans.
+- `scan_complete` event metadata always includes: `execution_mode`, `tool_timings`, `tools_selected_by` (llm | rule_fallback | fixed), `execution_graph`.
+
+### Agent 2 — Analyst (LLM + RAG)
+
+**File:** `modules/ai/analyst_agent.py`
+
+- Sole source of `AnalysisReport` — no duplicate LLM paths exist.
+- Input: structured findings JSON + RAG query result (including `kev_matches`)
+- RAG result always injected before LLM call. `kev_matches` boosts severity reasoning: analyst flags "known exploited in wild" when the list is non-empty.
+- Output schema (`AnalysisReport`): `executive_summary`, `risk_score`, `attack_chains`, `owasp_coverage`, `critical_findings`, `remediation_priorities`, `analyst_notes`, `top_risks`, `key_priorities`, `rag_context_used`, `retrieval_method`, `model_used`
+- Prompt is fully structured — LLM cannot modify flow.
+
+### Agent 3 — Remediation Advisor
+
+**File:** `modules/ai/remediation_agent.py`
+
+- Input: processed findings from Agent 2
+- Output: step-by-step remediation, prioritized fix list
 - Uses RAG to retrieve known remediation patterns
-- Located: `modules/ai/remediation_agent.py`
 
 ---
 
@@ -231,112 +258,219 @@ def analyze_findings(findings: dict) -> dict:
 
 ---
 
-## 9. In Progress (Week 2 — 🔧 Active Build)
+## 9. Execution Graph (`modules/pentest/execution_graph.py`)
 
-### Active Scanning Engine
-- [x] `nuclei_scanner.py` — Nuclei CVE/misconfiguration scanning
-- [ ] `nmap_scanner.py` — Port/service enumeration
-- [ ] `active_scan.py` — Full active pipeline orchestrator
+The execution graph is a pure Python directed acyclic graph (DAG) built during every active scan. It requires no external graph library — implemented with dataclasses and dicts.
 
-### AI Agent Layer
-- [ ] `rag_engine.py` — FAISS-based knowledge retrieval
-- [ ] `analyst_agent.py` — Agent 2: LLM interpretation
-- [ ] `remediation_agent.py` — Agent 3: Fix guidance
-- [ ] Knowledge base JSON files
+### Node Types
+| Type | Fields |
+|---|---|
+| `tool_execution` | node_id (UUID4), tool_name, target, status, duration_ms, finding_count, timestamp |
+| `finding` | node_id (UUID4), severity, title, cve_ids, owasp_categories, tool_source |
+
+### Edge Type
+| Type | Meaning |
+|---|---|
+| `triggered_by` | A finding node points back to the tool_execution node that produced it |
+
+### Public API
+```python
+graph = init_graph(scan_id)
+exec_node = add_tool_execution(graph, tool_name, target, ...)
+finding_node = add_finding(graph, severity, title, ...)
+link_nodes(graph, finding_node.node_id, exec_node.node_id, "triggered_by")
+payload = export_graph(graph)  # JSON-serialisable dict
+```
+
+### Integration with `active_scan.py`
+- `init_graph()` called once at scan start in `_deterministic_scan`
+- `add_tool_execution()` + `add_finding()` + `link_nodes()` called after each tool completes
+- `export_graph()` output embedded in `scan_complete` event metadata under key `"execution_graph"`
+- Additive instrumentation only — zero existing `active_scan.py` logic was changed
+- `_adaptive_scan` is not yet instrumented (future task)
+
+### Future
+- Store `execution_graph` JSON in DB scan record as JSONB column for persistence beyond Celery event stream
+- Use graph for attack path visualization in frontend
+- Enable Find → Fix → Verify loop via graph-driven re-scan targeting
 
 ---
 
-## 10. Data Flow: Complete Scan Pipeline
+## 10. RAG Engine and Knowledge Base (`modules/ai/rag_engine.py`)
+
+### Retrieval Strategy
+
+FAISS + sentence-transformers (`all-MiniLM-L6-v2`) is the **primary** retrieval path. If FAISS or sentence-transformers fails to import (common on Windows dev without MSVC/conda), the engine silently falls back to TF-IDF keyword matching. The `retrieval_method` field in every `AnalysisReport` records which path was used — this is itself a research data point.
+
+| Mode | Trigger | Notes |
+|---|---|---|
+| `faiss` | FAISS + sentence-transformers available | Semantic similarity, preferred |
+| `keyword` | FAISS/sentence-transformers unavailable | TF-IDF, dev resilience fallback |
+
+### Knowledge Base Sources
+
+| File | Contents | Notes |
+|---|---|---|
+| `owasp_top10.json` | OWASP Top 10 explanations + impacts | Local, static |
+| `security_headers.json` | Header best practices and fix patterns | Local, static |
+| `remediation_guides.json` | Step-by-step fix guides per vuln type | Local, static |
+| `cve_summaries.json` | NVD CVEs last 3y, CVSS ≥ 7.0 | Gitignored, refresh via `fetch_cve.py` |
+| `exploit_db.json` | Exploit-DB full catalog (48,058 entries) | Gitignored, refresh via `fetch_exploitdb.py` |
+| `kev_catalog.json` | CISA KEV full catalog (1,579+ entries) | Committed (~1.2 MB), refresh via `fetch_kev.py` |
+
+All files are loaded at RAG engine startup. Missing files are skipped gracefully — the pipeline continues with whatever sources are available.
+
+### CISA KEV Integration (`knowledge_base/kev_loader.py`)
+
+KEV lookup runs at query time as a high-priority enrichment step before FAISS/keyword retrieval:
+
+1. `rag_engine.query()` extracts CVE IDs from findings text using regex
+2. `kev_loader.search_kev()` matches extracted CVE IDs against the cached KEV catalog
+3. Matches are prepended as `[KEV ALERT]` blocks in the context string — highest priority position
+4. `kev_matches: list[str]` and `kev_alerts: list[str]` are returned as additive keys in the query result dict
+
+`kev_loader.py` details:
+- `load_kev_entries()` — async, fetches CISA KEV JSON feed, normalises to `KEVEntry` Pydantic schema, writes `kev_cache.json` (24hr TTL)
+- `get_cached_kev()` — sync, reads local cache; safe to call at startup without network I/O
+- `kev_cache.json` is gitignored (auto-refreshed at runtime). `kev_catalog.json` is the committed full catalog used by the RAG FAISS index.
+- Network failure degrades gracefully: stale cache used if present, empty list with warning logged if absent.
+- Future: wire `await load_kev_entries()` into FastAPI lifespan for eager pre-warm before first scan.
+
+### RAG Query Context Priority Order
 
 ```
-POST /api/v1/scans
-        │
-        ▼
-  [Auth + Tier Check]
-        │
-        ▼
-  [Scan Record: PostgreSQL status=pending]
-        │
-        ▼
-  [BackgroundTask / Celery Worker]
-        │
-        ├──► [Agent 1: Orchestrator]
-        │         │
-        │         ├──► Passive Recon (always)
-        │         │     ├── DNS Intel
-        │         │     ├── SSL Analyzer
-        │         │     ├── Header Checker
-        │         │     ├── Tech Fingerprint
-        │         │     └── Breach Check
-        │         │
-        │         └──► Active Scan (paid tier only)
-        │               ├── Nuclei Scanner
-        │               └── Nmap Scanner
-        │
-        ├──► [Agent 2: Analyst]
-        │         └── RAG context + LLM analysis
-        │
-        ├──► [Agent 3: Remediation Advisor]
-        │         └── Prioritized fix plan
-        │
-        └──► [PostgreSQL: status=complete, results=JSON]
+[KEV ALERT blocks]          ← actively exploited CVEs (highest priority)
+[KEV CATALOG DETAIL]        ← full KEV entry for matched CVEs
+[OWASP guidance]            ← category-matched OWASP Top 10
+[Header best practices]     ← if header findings present
+[Remediation guides]        ← vuln-type matched fix patterns
+[Exploit-DB references]     ← public exploit evidence
+[CVE Summaries]             ← NVD detail for matched CVEs
+```
 
-GET /api/v1/scans/{id}
-  └── Free: top 3 findings shown, rest blurred
-  └── Paid: full findings + AI report
+### `rag_engine.query()` Return Schema
+
+```python
+{
+    "owasp": List[Dict],           # OWASP/KEV-catalog FAISS results
+    "headers": List[Dict],         # header KB results
+    "exploits": List[Dict],        # exploit_db results
+    "cve_summaries": List[Dict],   # NVD CVE results
+    "kev_matches": List[str],      # CVE IDs matched in KEV catalog
+    "kev_alerts": List[str],       # formatted [KEV ALERT] strings
+    "kev_catalog": List[Dict],     # full KEV entries for matched CVEs
+}
 ```
 
 ---
 
 ## 11. Control Constraints (Critical Safety Rules)
 
-| Rule | Status |
-|---|---|
-| AI must NOT decide which tools to execute | ✅ Enforced — all flow in Python code |
-| AI must NOT modify execution order | ✅ Fixed pipeline sequence |
-| AI must NOT skip pipeline steps | ✅ Steps run unconditionally |
-| AI ONLY analyzes tool outputs | ✅ Strict prompt boundaries |
-| LLM outputs are structured JSON | ✅ Validated via Pydantic |
+| Rule | Status | Implementation |
+|---|---|---|
+| LLM may recommend tools only from code-enforced allowlist | ✅ | `TOOL_REGISTRY` + `OPERATIONAL_REGISTRY` validation in `orchestrator.py` |
+| LLM cannot execute tools directly | ✅ | All dispatch goes through `_execute_tool()` → `OPERATIONAL_REGISTRY` |
+| LLM cannot introduce tools outside the registry | ✅ | Invalid selection triggers deterministic rule-based fallback, never halts |
+| LLM cannot request additional scans mid-pipeline | ✅ | `follow_up_tools` / `orchestrate_mini_scan` path removed (ADR-007) |
+| AI ONLY interprets structured tool output JSON | ✅ | Strict prompt boundaries in `analyst_agent.py` and `remediation_agent.py` |
+| All LLM outputs validated before use | ✅ | Pydantic `AnalysisReport` schema enforced in `analyst_agent.py` |
+| KEV data never influences tool selection or execution | ✅ | KEV enrichment is analysis-layer only (`rag_engine.py` / `analyst_agent.py`) |
+| Passive scans always avoid active tooling | ✅ | Enforced in `scan_tasks.py` worker boundary, not just API tier check |
+| Tier-gating enforced at API layer | ✅ | `Depends(require_paid_tier)` in route handlers |
+| All LLM tool selections are logged with reasoning | ✅ | `tools_selected_by` field in `scan_complete` metadata |
 
 ---
 
-## 12. Next Steps & Roadmap
+## 12. Scan Event Metadata Schema
 
-### Immediate (Week 2)
-1. Build `nmap_scanner.py` — port/service enumeration wrapper
-2. Build `active_scan.py` — full active scan orchestrator (Agent 1)
-3. Build `rag_engine.py` — FAISS + knowledge base
-4. Build `analyst_agent.py` — Agent 2 LLM interpretation
-5. Build `remediation_agent.py` — Agent 3 fix advisor
-6. Populate knowledge base JSON files
-## 13. Execution Graph (Emerging Capability)
+The `scan_complete` Celery event and the persisted scan record include the following metadata fields. These are the canonical research data capture points.
 
-Each scan incrementally builds a directed graph:
+### `scan_complete` event metadata
 
-- Nodes:
-  - Tool executions
-  - Findings
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `execution_mode` | `"deterministic"` \| `"adaptive"` | `active_scan.py` | Which orchestrator mode ran |
+| `tool_timings` | `Dict[str, float]` | `active_scan.py` | Per-tool wall-clock seconds |
+| `tools_selected_by` | `Dict[str, str]` | `active_scan.py` (adaptive) | `"llm"` \| `"rule_fallback"` \| `"fixed"` per tool |
+| `execution_graph` | `Dict` (JSON DAG) | `execution_graph.export_graph()` | Full causal DAG; always present for active/full scans |
 
-- Edges:
-  - causal relationships (triggered_by)
+### `ai_report` metadata (stored in scan record)
 
-This enables:
-- attack path visualization
-- reproducible verification
-- structured research benchmarking
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `rag_context_used` | `bool` | `analyst_agent.py` | Whether RAG context was injected |
+| `retrieval_method` | `"faiss"` \| `"keyword"` | `rag_engine.py` | Which retrieval path was active |
+| `kev_matches` | `List[str]` | `rag_engine.query()` | CVE IDs matched in CISA KEV; non-empty triggers "known exploited in wild" flag |
+| `model_used` | `str` | `analyst_agent.py` | LiteLLM model string (e.g. `"groq/llama-3..."`) |
 
-This graph is:
-- written during execution
-- immutable post-scan
-- used by AI only for interpretation (not control)
+---
+
+## 13. Data Flow: Complete Scan Pipeline
+
+```
+POST /api/v1/scans
+        │
+        ▼
+  [Auth + Tier Check] → require_paid_tier for active/full scan types
+        │
+        ▼
+  [Scan Record: PostgreSQL status=pending]
+        │
+        ▼
+  [Celery: scan_tasks.orchestrate_scan(scan_id, scan_type, scan_mode)]
+        │
+        ├──► scan_type="passive" ─────► modules/recon/passive_recon.py
+        │         ├── DNS Intel                   (free tier)
+        │         ├── SSL Analyzer
+        │         ├── Header Checker
+        │         ├── Tech Fingerprint
+        │         └── Breach Check
+        │
+        └──► scan_type="active"|"full" ─► modules/pentest/active_scan.py
+                  │                              (paid tier only)
+                  ├── scan_mode="deterministic"
+                  │     └── _deterministic_scan (SCAN_PROFILES fixed order)
+                  │           + execution_graph instrumentation
+                  │
+                  └── scan_mode="adaptive"
+                        └── _adaptive_scan (OrchestratorAgent LLM + allowlist)
+        │
+        ▼
+  [Celery chain: analyst_tasks.run_analyst]
+        └── RAG query (KEV enrichment + FAISS/keyword retrieval)
+        └── analyst_agent.analyze_findings() → AnalysisReport
+        └── remediation_agent.run()
+        │
+        ▼
+  [PostgreSQL: status=complete, results=JSON, ai_report=JSON]
+
+GET /api/v1/scans/{id}
+  └── Free: top 3 findings shown, remainder gated
+  └── Paid: full findings + AI report (AnalysisReport)
+```
+
+---
+
+## 14. Roadmap
+
+### Immediate (Next Tasks)
+1. Store `execution_graph` JSON in DB scan record (JSONB column) — `@backend-engineer`
+2. Wire analyst KEV boost: `kev_matches` from RAG result passed into analyst severity reasoning — `@ai-architect`
+3. Wire `await load_kev_entries()` into FastAPI lifespan for KEV cache pre-warm — `@backend-engineer`
+4. `@reviewer` full audit of pentest + worker pipeline changes
+
 ### Week 3
-7. Celery worker migration (Redis-backed, scalable)
-8. Frontend dashboard (React/Vite) — findings table, AI panel
-9. PDF report generation
-10. Alembic database migrations
+5. React frontend (Dashboard, FindingsTable, AIInsightsPanel)
+6. PDF report generation (ReportLab)
+7. Alembic database migrations (replace dev auto-create)
+8. Broader integration test coverage (full scan path + report chain)
+9. `cve_summaries.json` fetch completion verification
 
 ### Production (Linux Deploy)
-11. Docker production image with pre-installed tools
-12. Nginx reverse proxy + SSL termination
-13. Environment variable management (secrets)
-14. Monitoring + alerting
+10. Docker production image with pre-installed tools
+11. Nginx reverse proxy + SSL termination
+12. Environment variable management (secrets)
+13. Monitoring + alerting
+14. Pentest Task Tree (PTT) for orchestrator-driven follow-up scans
+15. Attack path chaining visualization using execution graph
+16. Continuous verification loop (Find → Fix → Verify)

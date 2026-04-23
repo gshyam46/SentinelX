@@ -35,6 +35,10 @@ _KB_FILES = {
     "owasp_top10": "owasp_top10.json",
     "security_headers": "security_headers.json",
     "remediation_guides": "remediation_guides.json",
+    # New high-signal sources — loaded when present; skipped gracefully if absent
+    "kev_catalog": "kev_catalog.json",
+    "exploit_db": "exploit_db.json",
+    "cve_summaries": "cve_summaries.json",
 }
 
 
@@ -63,6 +67,33 @@ def _kb_entry_to_text(entry: dict, source: str) -> str:
             " ".join(entry.get("keywords", [])),
             " ".join(entry.get("fix_steps", [])),
         ]
+    elif source == "kev_catalog":
+        parts = [
+            entry.get("cve_id", ""),
+            entry.get("vulnerability_name", ""),
+            entry.get("vendor", ""),
+            entry.get("product", ""),
+            entry.get("description", ""),
+            entry.get("required_action", ""),
+            entry.get("notes", ""),
+        ]
+    elif source == "exploit_db":
+        parts = [
+            entry.get("description", ""),
+            entry.get("type", ""),
+            entry.get("platform", ""),
+            entry.get("author", ""),
+            " ".join(entry.get("codes", [])),
+            " ".join(entry.get("tags", [])),
+        ]
+    elif source == "cve_summaries":
+        parts = [
+            entry.get("cve_id", ""),
+            entry.get("description", ""),
+            entry.get("severity", ""),
+            entry.get("attack_vector", ""),
+            " ".join(entry.get("cwe_ids", [])),
+        ]
     return " ".join(p for p in parts if p)
 
 
@@ -88,10 +119,13 @@ class RAGEngine:
         self._model = None          # SentenceTransformer
         self._index = None          # faiss.Index
         self._index_docs: list[dict] = []      # parallel to index rows
-        self._index_sources: list[str] = []    # "owasp_top10" | "security_headers" | "remediation_guides"
+        self._index_sources: list[str] = []    # source key per indexed doc
 
         # KEV catalog — loaded from cache at startup (sync, no network)
         self._kev_entries: List[KEVEntry] = []
+
+        # kev_catalog.json entries (richer, persisted file — separate from kev_cache)
+        self._kev_catalog: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Load
@@ -149,10 +183,14 @@ class RAGEngine:
         # 3. Load KEV catalog from local cache (sync — no network at startup)
         try:
             self._kev_entries = get_cached_kev()
-            logger.info("RAG: KEV catalog loaded — %d entries", len(self._kev_entries))
+            logger.info("RAG: KEV cache loaded — %d entries", len(self._kev_entries))
         except Exception as exc:
-            logger.warning("RAG: KEV catalog load failed (%s) — KEV enrichment disabled", exc)
+            logger.warning("RAG: KEV cache load failed (%s) — KEV enrichment disabled", exc)
             self._kev_entries = []
+
+        # 4. Mirror kev_catalog from _kb if the file was loaded
+        self._kev_catalog = self._kb.get("kev_catalog", [])
+        logger.info("RAG: kev_catalog.json — %d entries", len(self._kev_catalog))
 
         self._loaded = True
 
@@ -254,34 +292,60 @@ class RAGEngine:
         """
         Retrieve relevant KB entries for a list of findings.
 
+        Priority routing:
+          1. KEV hits (CISA known-exploited) — prepended first, highest urgency.
+          2. Normal RAG retrieval (OWASP / headers / remediation / exploit_db / cve_summaries).
+
         Returns:
             {
-                "owasp":       list[dict],   # OWASP Top-10 matches
-                "headers":     list[dict],   # security-header matches
-                "remediation": list[dict],   # remediation guide matches
-                "kev_matches": list[str],    # CVE IDs found in CISA KEV catalog
-                "kev_alerts":  list[str],    # pre-formatted KEV alert strings (prepend to prompt)
+                "owasp":        list[dict],
+                "headers":      list[dict],
+                "remediation":  list[dict],
+                "exploit_db":   list[dict],   # Exploit-DB matches (additive)
+                "cve_summaries":list[dict],   # NVD CVE matches (additive)
+                "kev_matches":  list[str],    # CVE IDs found in CISA KEV
+                "kev_alerts":   list[str],    # pre-formatted KEV alert strings
             }
-
-        Existing callers that only read "owasp"/"headers"/"remediation" keys are
-        unaffected — the new keys are purely additive.
         """
         if not self._loaded:
             self.load()
 
-        # -- FAISS / keyword retrieval (unchanged) --
+        # -- Step 1: KEV CVE ID enrichment (highest priority) --
+        cve_ids = self._extract_cve_ids(findings)
+        kev_matches, kev_alerts = self._build_kev_alerts(cve_ids)
+
+        # -- Step 2: normal RAG retrieval --
         if self._use_faiss:
             base = self._faiss_query(findings, top_k)
         else:
             base = self._keyword_query(findings, top_k)
 
-        # -- KEV enrichment (additive) --
-        cve_ids = self._extract_cve_ids(findings)
-        kev_matches, kev_alerts = self._build_kev_alerts(cve_ids)
+        # If KEV hits found, also surface matching kev_catalog entries
+        kev_catalog_hits = self._match_kev_catalog(cve_ids, top_k)
+        if kev_catalog_hits:
+            # Prepend KEV catalog entries before normal retrieval results
+            base["kev_catalog"] = kev_catalog_hits
+        else:
+            base["kev_catalog"] = []
 
         base["kev_matches"] = kev_matches
         base["kev_alerts"] = kev_alerts
         return base
+
+    def _match_kev_catalog(
+        self, cve_ids: List[str], top_k: int
+    ) -> List[Dict[str, Any]]:
+        """Return kev_catalog.json entries that match any CVE in cve_ids."""
+        if not cve_ids or not self._kev_catalog:
+            return []
+        needle_set = {c.upper() for c in cve_ids}
+        hits: List[Dict[str, Any]] = []
+        for entry in self._kev_catalog:
+            if entry.get("cve_id", "").upper() in needle_set:
+                hits.append(entry)
+                if len(hits) >= top_k:
+                    break
+        return hits
 
     def query_single(
         self,
@@ -327,13 +391,22 @@ class RAGEngine:
         scores, indices = self._index.search(query_vec, k)
 
         # Group by source, deduplicate, cap at top_k each
-        result: Dict[str, List[Dict]] = {"owasp": [], "headers": [], "remediation": []}
+        result: Dict[str, List[Dict]] = {
+            "owasp": [], "headers": [], "remediation": [],
+            "exploit_db": [], "cve_summaries": [],
+        }
         source_map = {
             "owasp_top10": "owasp",
             "security_headers": "headers",
             "remediation_guides": "remediation",
+            "kev_catalog": "owasp",       # KEV catalog enriches OWASP bucket
+            "exploit_db": "exploit_db",
+            "cve_summaries": "cve_summaries",
         }
-        seen_per_source: Dict[str, int] = {"owasp": 0, "headers": 0, "remediation": 0}
+        seen_per_source: Dict[str, int] = {
+            "owasp": 0, "headers": 0, "remediation": 0,
+            "exploit_db": 0, "cve_summaries": 0,
+        }
 
         for idx in indices[0]:
             if idx < 0 or idx >= len(self._index_docs):
@@ -371,6 +444,8 @@ class RAGEngine:
             "owasp": self._kw_match_owasp(combined_text, top_k),
             "headers": self._kw_match_headers(combined_text, top_k),
             "remediation": self._kw_match_remediation(finding_texts, top_k),
+            "exploit_db": self._kw_match_exploitdb(combined_text, top_k),
+            "cve_summaries": self._kw_match_cve(combined_text, top_k),
         }
 
     def _kw_match_owasp(self, text: str, top_k: int) -> List[Dict]:
@@ -415,6 +490,34 @@ class RAGEngine:
         sorted_guides = sorted(guide_best.values(), key=lambda x: x[0], reverse=True)
         return [g for _, g in sorted_guides[:top_k]]
 
+    def _kw_match_exploitdb(self, text: str, top_k: int) -> List[Dict]:
+        scored = []
+        for entry in self._kb.get("exploit_db", []):
+            score = self._keyword_score(text, [
+                entry.get("description", ""),
+                entry.get("type", ""),
+                entry.get("platform", ""),
+                " ".join(entry.get("codes", [])),
+                " ".join(entry.get("tags", [])),
+            ])
+            if score > 0:
+                scored.append((score, entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [e for _, e in scored[:top_k]]
+
+    def _kw_match_cve(self, text: str, top_k: int) -> List[Dict]:
+        scored = []
+        for entry in self._kb.get("cve_summaries", []):
+            score = self._keyword_score(text, [
+                entry.get("cve_id", ""),
+                entry.get("description", ""),
+                " ".join(entry.get("cwe_ids", [])),
+            ])
+            if score > 0:
+                scored.append((score, entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [e for _, e in scored[:top_k]]
+
     @staticmethod
     def _keyword_score(text: str, corpus: List[str]) -> float:
         text_lower = text.lower()
@@ -451,6 +554,18 @@ class RAGEngine:
             kev_lines.extend(kev_alerts)
             sections.append("\n".join(kev_lines))
 
+        # KEV catalog detail block (if catalog hits exist)
+        kev_catalog: list[dict] = context.get("kev_catalog", [])
+        if kev_catalog:
+            kcat_lines = ["=== KEV CATALOG DETAIL ==="]
+            for entry in kev_catalog[:3]:
+                kcat_lines.append(
+                    f"{entry.get('cve_id', '')} | {entry.get('vulnerability_name', '')} | "
+                    f"{entry.get('vendor', '')} {entry.get('product', '')} | "
+                    f"Action: {entry.get('required_action', '')[:200]}"
+                )
+            sections.append("\n".join(kcat_lines))
+
         if context.get("owasp"):
             owasp_lines = ["=== OWASP CONTEXT ==="]
             for entry in context["owasp"][:2]:
@@ -479,6 +594,27 @@ class RAGEngine:
                     + " | ".join(steps)
                 )
             sections.append("\n".join(remed_lines))
+
+        if context.get("exploit_db"):
+            edb_lines = ["=== EXPLOIT-DB MATCHES ==="]
+            for entry in context["exploit_db"][:2]:
+                codes = ", ".join(entry.get("codes", [])[:3])
+                edb_lines.append(
+                    f"EDB-{entry.get('id', '')} [{entry.get('type', '')}|{entry.get('platform', '')}] "
+                    f"{entry.get('description', '')[:200]} "
+                    f"| CVE refs: {codes or 'none'} | Verified: {entry.get('verified', '0')}"
+                )
+            sections.append("\n".join(edb_lines))
+
+        if context.get("cve_summaries"):
+            cve_lines = ["=== CVE SUMMARIES ==="]
+            for entry in context["cve_summaries"][:2]:
+                cve_lines.append(
+                    f"{entry.get('cve_id', '')} [{entry.get('severity', '').upper()}] "
+                    f"CVSS {entry.get('cvss_score', '?')} AV:{entry.get('attack_vector', '?')} "
+                    f"— {entry.get('description', '')[:200]}"
+                )
+            sections.append("\n".join(cve_lines))
 
         full_context = "\n\n".join(sections)
         if len(full_context) > max_chars:

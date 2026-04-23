@@ -10,12 +10,16 @@ Full-stack AI-powered cybersecurity assessment platform.
 
 ## Critical Architecture Rules (Never Violate)
 
-1. AI (LLM) NEVER decides which tools to execute — all flow is deterministic Python code
-2. LLM ONLY interprets structured JSON tool outputs — it never discovers vulnerabilities
-3. Agent 1 (Orchestrator) = pure Python, zero LLM involvement
-4. Agent 2 (Analyst) + Agent 3 (Remediation) = LLM + RAG, strict prompt boundaries
-5. All LLM outputs validated via Pydantic before use
-6. Tier-gating enforced at API layer: free = passive recon only, paid = active scan + AI report
+
+
+1. AI (LLM) MAY recommend tool selection in adaptive mode, but execution is strictly enforced by Python allowlists (`TOOL_REGISTRY` + `OPERATIONAL_REGISTRY`)
+2. LLM NEVER executes tools, introduces new tools, or bypasses constraints
+3. LLM ONLY interprets structured JSON tool outputs — it never performs vulnerability discovery
+4. Agent 1 (Orchestrator) = deterministic + constrained adaptive controller(LLM-guided, Python-enforced)
+5. Agent 2 (Analyst) + Agent 3 (Remediation) = LLM + RAG, strict prompt boundaries
+6. All LLM outputs must pass Pydantic validation before use
+7. Tier-gating enforced at API layer: free = passive recon only, paid = active scan + AI report
+8. LLM cannot trigger follow-up scans or additional tool executions (future handled via orchestrator-driven PTT only)
 
 ## Directory Map
 
@@ -44,8 +48,9 @@ sentinelX/
 ## Build Status (update in PROGRESS.md, not here)
 
 - ✅ Week 1 DONE: DB, JWT auth, tier-gating, scan management, full passive recon engine
-- 🔧 Week 2 ACTIVE: nmap_scanner, active_scan orchestrator, RAG engine, AI agents
-- ⬜ Week 3: Celery migration, React frontend, PDF reports, Alembic migrations
+- ✅ Week 2 DONE: constrained adaptive orchestrator, Celery pipeline wired (scan_type + scan_mode), FAISS RAG with keyword fallback, execution graph (causal DAG), KEV integration (kev_loader + kev_catalog + rag_engine enrichment), unified AnalysisReport schema, full KB expansion (Exploit-DB + NVD CVE)
+- 🔧 Week 2 REMAINING: scan metadata JSONB persistence, analyst KEV boost wiring, KEV lifespan pre-warm, @reviewer audit
+- ⬜ Week 3: React frontend, PDF reports, Alembic migrations, Docker prod image
 
 ## Coding Standards
 

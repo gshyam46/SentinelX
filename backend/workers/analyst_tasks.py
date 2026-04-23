@@ -11,6 +11,7 @@ AnalysisReport via LiteLLM, then chains to generate_report (Agent 3).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import traceback
 import uuid
@@ -67,7 +68,15 @@ async def _db_save_ai_report(scan_id: uuid.UUID, report: dict) -> None:
         result = await db.execute(select(Scan).where(Scan.id == scan_id))
         scan = result.scalar_one()
         existing = scan.results or {}
-        scan.results = {**existing, "ai_report": report}
+        # kev_matches is promoted to a top-level results key so it is
+        # accessible to the analyst context and any future downstream readers
+        # without having to dig into ai_report.
+        kev_matches: list[str] = report.get("kev_matches", [])
+        scan.results = {
+            **existing,
+            "ai_report": report,
+            "kev_matches": kev_matches,
+        }
         scan.current_step = "AI analysis complete"
         await db.commit()
 
@@ -190,6 +199,7 @@ def run_analyst(scan_id: str) -> dict:
                 "type": "analyst_complete",
                 "scan_id": scan_id,
                 "risk_score": report.get("risk_score", 0),
+                "kev_matches": report.get("kev_matches", []),
             },
         )
 
