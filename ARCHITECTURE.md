@@ -29,7 +29,20 @@ The AI does **not** discover vulnerabilities. It strictly:
 - Generates remediation guidance
 - Provides executive-level summaries
 
-**Control flow is always handled by code, never by the LLM.**
+### Layer 3 — Execution Intelligence (Emerging)
+
+SentinelX incrementally builds an internal execution graph during scans:
+
+tool → finding → subsequent tool → verification
+
+This transforms linear scan outputs into causal attack paths.
+
+This layer enables:
+- attack chain reconstruction
+- audit-grade evidence trails
+- future automated verification loops (Find → Fix → Verify)
+
+(Currently additive — does not alter execution flow)
 
 ---
 
@@ -125,14 +138,13 @@ sentinelX/
 
 ## 5. Agent Roles (Strictly Defined)
 
-### 🔹 Agent 1 — Orchestrator (Deterministic Controller)
-**Implementation:** Pure Python code — no LLM involvement.
-- Receives target domain
-- Triggers tools in a fixed sequence:
-  `DNS → Passive Recon → Nuclei → Nmap → Aggregation`
-- Manages timeouts, errors, and pipeline state
-- Produces a unified `findings` JSON payload
-- Located: `modules/pentest/active_scan.py`
+### 🔹 Agent 1 — Orchestrator (Deterministic + Constrained Adaptive Controller)
+
+- Executes tools via fixed pipelines OR adaptive selection mode
+- In adaptive mode:
+  - LLM recommends next tool from TOOL_REGISTRY
+  - Python validates against OPERATIONAL_REGISTRY
+- Maintains execution state and (future) execution graph
 
 ### 🔹 Agent 2 — Analyst (LLM + RAG)
 **Implementation:** LiteLLM + FAISS RAG
@@ -162,11 +174,16 @@ The system uses a lightweight FAISS-based RAG for local, fast retrieval.
 | `security_headers.json` | Header best practices and fix patterns |
 | `cve_summaries.json` | Common CVE descriptions and severity |
 | `remediation_guides.json` | Step-by-step fix guides per vuln type |
-
+| `kev_catalog.json` | CISA Known Exploited Vulnerabilities (auto-synced) |
+| `exploit_db.json` | Public exploit references for validation and prioritization |
 ### RAG Flow
 ```
 Finding → Embed with sentence-transformers → FAISS similarity search
 → Top-3 context chunks → Injected into LLM prompt → Structured response
+RAG prioritizes:
+1. Known exploited vulnerabilities (KEV)
+2. Matching CVEs from findings
+3. OWASP and remediation patterns
 ```
 
 ---
@@ -292,7 +309,26 @@ GET /api/v1/scans/{id}
 4. Build `analyst_agent.py` — Agent 2 LLM interpretation
 5. Build `remediation_agent.py` — Agent 3 fix advisor
 6. Populate knowledge base JSON files
+## 13. Execution Graph (Emerging Capability)
 
+Each scan incrementally builds a directed graph:
+
+- Nodes:
+  - Tool executions
+  - Findings
+
+- Edges:
+  - causal relationships (triggered_by)
+
+This enables:
+- attack path visualization
+- reproducible verification
+- structured research benchmarking
+
+This graph is:
+- written during execution
+- immutable post-scan
+- used by AI only for interpretation (not control)
 ### Week 3
 7. Celery worker migration (Redis-backed, scalable)
 8. Frontend dashboard (React/Vite) — findings table, AI panel

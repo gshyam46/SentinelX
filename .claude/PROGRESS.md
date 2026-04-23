@@ -22,6 +22,13 @@
   - worker-boundary pipeline execution and metadata persistence
 - Verified the targeted tests pass with:
   - `backend\venv\Scripts\python.exe -m pytest backend/test_api.py`
+- Built `modules/pentest/execution_graph.py` — pure Python causal DAG (no external libs)
+  - `init_graph`, `add_tool_execution`, `add_finding`, `link_nodes`, `export_graph` public API
+  - node types: `tool_execution`, `finding`; edge type: `triggered_by`; UUID4 node IDs
+- Wired execution graph into `_deterministic_scan` in `active_scan.py` (additive only, zero existing logic changed)
+  - graph initialised at scan start; each tool execution + its findings are recorded and linked
+  - `scan_complete` metadata now always includes `execution_graph` key
+- 36/36 tests passing: `backend\venv\Scripts\python.exe -m pytest backend/modules/pentest/test_execution_graph.py -v`
 
 ### Active Tasks
 - [x] `tool_registry.py` - operational registry + scan profiles
@@ -30,12 +37,15 @@
 - [x] `orchestrator._execute_tool` - dispatches through `OPERATIONAL_REGISTRY`
 - [x] `nuclei_scanner.py` - MOCK_MODE + `owasp_categories`
 - [x] `nmap_scanner.py` - MOCK_MODE + `owasp_categories`
-- [x] `rag_engine.py` - FAISS primary path with keyword fallback
+- [x] `rag_engine.py` - FAISS primary path with keyword fallback; KEV-enriched query (2026-04-24)
 - [x] `analyst_agent.py` - unified `AnalysisReport` schema + research metadata
 - [x] `analyst_tasks.py` - calls `analyze_findings()` as single source of truth
 - [x] `workers/scan_tasks.py` - `scan_type` + `scan_mode` boundary wiring complete
 - [x] `backend/test_api.py` - isolated integration coverage added and passing
+- [x] `execution_graph.py` - causal DAG for tool chaining (36/36 tests passing)
+- [x] `kev_loader.py` - CISA KEV feed loader with 24h cache, fallback, Pydantic schema (31/31 tests passing)
 - [ ] `@reviewer` audit - next priority
+- [ ] ARCHITECTURE.md sync - reflect adaptive orchestrator + Celery reality
 
 ---
 
@@ -57,9 +67,11 @@
 | Nuclei Scanner | `modules/pentest/nuclei_scanner.py` | MOCK_MODE + OWASP categories |
 | Nmap Scanner | `modules/pentest/nmap_scanner.py` | MOCK_MODE + OWASP categories |
 | ZAP Scanner | `modules/pentest/zap_scanner.py` | CLI + daemon, passive + active, MOCK_MODE |
-| Active Scan Dispatcher | `modules/pentest/active_scan.py` | deterministic + adaptive execution |
+| Active Scan Dispatcher | `modules/pentest/active_scan.py` | deterministic + adaptive execution + execution graph wiring |
 | Operational Tool Registry | `modules/pentest/tool_registry.py` | runnable tools + scan profiles |
-| RAG Engine | `modules/ai/rag_engine.py` | FAISS + sentence-transformers fallback strategy |
+| Execution Graph | `modules/pentest/execution_graph.py` | causal DAG — tool→finding edges, UUID4 nodes, JSON export |
+| RAG Engine | `modules/ai/rag_engine.py` | FAISS + sentence-transformers fallback; KEV-enriched query with kev_matches + kev_alerts |
+| KEV Loader | `modules/ai/knowledge_base/kev_loader.py` | CISA KEV feed, 24h cache, Pydantic KEVEntry, graceful fallback |
 | Analyst Agent | `modules/ai/analyst_agent.py` | full `AnalysisReport` schema + research metadata |
 | Analyst Task | `workers/analyst_tasks.py` | wired to analyst agent, no duplicate LLM path |
 | Celery Pipeline | `workers/scan_tasks.py`, `workers/analyst_tasks.py` | scan -> analyst -> report |
@@ -78,7 +90,10 @@
 - Alembic migrations (replace dev auto-create)
 - Docker production image
 - Nginx + SSL
-
+- - Pentest Task Tree (PTT) for orchestrator-driven follow-ups
+- Attack path chaining using execution graph
+- Continuous verification (Find → Fix → Verify loop)
+- LLM security module (prompt injection, tool shadowing detection)
 ---
 
 ## Architecture Decisions Log
@@ -106,7 +121,8 @@
 ## Next 3 Tasks (ordered)
 1. Run `@reviewer` audit on the pentest + worker pipeline changes
 2. Sync `CLAUDE.md` and `ARCHITECTURE.md` to the live adaptive/passive-worker architecture
-3. Extend isolated tests to cover the `full` scan path and report-ready chain
+3. Store `execution_graph` JSON in the DB scan record (JSONB column) so it persists beyond the Celery event stream
+4. Wire `await load_kev_entries()` into the FastAPI lifespan startup so the KEV cache is pre-populated before first scan
 
 ---
 _Last updated: 2026-04-24 by Codex_

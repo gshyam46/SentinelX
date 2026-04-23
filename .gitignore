@@ -5,8 +5,10 @@
 .env.production
 
 #claude
+.claude/
 .claude
-
+AGENTS.md
+ARCHITECTURE.md
 # Python
 __pycache__/
 *.py[cod]
@@ -46,6 +48,9 @@ data/reports/*.pdf
 data/reports/*.json
 *.faiss
 *.pkl
+
+# KEV cache (auto-refreshed at runtime, not committed)
+backend/modules/ai/knowledge_base/kev_cache.json
 
 # Logs
 *.log

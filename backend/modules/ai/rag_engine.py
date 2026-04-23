@@ -23,6 +23,11 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from backend.modules.ai.knowledge_base.kev_loader import KEVEntry, get_cached_kev, search_kev
+except ImportError:
+    from modules.ai.knowledge_base.kev_loader import KEVEntry, get_cached_kev, search_kev  # type: ignore
+
 logger = logging.getLogger("sentinelx.rag")
 
 _KB_DIR = Path(__file__).parent / "knowledge_base"
@@ -85,6 +90,9 @@ class RAGEngine:
         self._index_docs: list[dict] = []      # parallel to index rows
         self._index_sources: list[str] = []    # "owasp_top10" | "security_headers" | "remediation_guides"
 
+        # KEV catalog — loaded from cache at startup (sync, no network)
+        self._kev_entries: List[KEVEntry] = []
+
     # ------------------------------------------------------------------
     # Load
     # ------------------------------------------------------------------
@@ -138,6 +146,14 @@ class RAGEngine:
             logger.error("RAG: FAISS index build failed (%s) — using keyword fallback", exc)
             self._retrieval_method = "keyword"
 
+        # 3. Load KEV catalog from local cache (sync — no network at startup)
+        try:
+            self._kev_entries = get_cached_kev()
+            logger.info("RAG: KEV catalog loaded — %d entries", len(self._kev_entries))
+        except Exception as exc:
+            logger.warning("RAG: KEV catalog load failed (%s) — KEV enrichment disabled", exc)
+            self._kev_entries = []
+
         self._loaded = True
 
     def _build_faiss_index(self, faiss, np) -> None:
@@ -173,23 +189,99 @@ class RAGEngine:
     # Public query interface
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # KEV enrichment helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_cve_ids(findings: List[Dict[str, Any]]) -> List[str]:
+        """
+        Extract all CVE identifiers mentioned anywhere in the findings list.
+        Searches every string value in each finding dict using the canonical
+        CVE regex pattern.  Preserves order; deduplicates.
+        """
+        _CVE_PATTERN = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for finding in findings:
+            # Gather all string-like values from the finding dict
+            texts: list[str] = []
+            for val in finding.values():
+                if isinstance(val, str):
+                    texts.append(val)
+                elif isinstance(val, (list, tuple)):
+                    texts.extend(str(v) for v in val if v)
+            combined = " ".join(texts)
+            for match in _CVE_PATTERN.finditer(combined):
+                cve = match.group(0).upper()
+                if cve not in seen:
+                    seen.add(cve)
+                    ordered.append(cve)
+        return ordered
+
+    def _build_kev_alerts(
+        self, cve_ids: List[str]
+    ) -> tuple[list[str], list[str]]:
+        """
+        For each CVE in cve_ids, check the KEV catalog.
+        Returns:
+            kev_matches  — list of CVE IDs that matched KEV
+            kev_context  — list of formatted alert strings for prompt injection
+        """
+        kev_matches: list[str] = []
+        kev_context: list[str] = []
+        for cve_id in cve_ids:
+            hit = search_kev(cve_id, self._kev_entries)
+            if hit:
+                kev_matches.append(hit.cve_id)
+                kev_context.append(
+                    f"[KEV ALERT] {hit.cve_id} is in CISA's Known Exploited Vulnerabilities catalog. "
+                    f"Product: {hit.vendor_project} {hit.product}. "
+                    f"This vulnerability has been actively exploited in the wild."
+                )
+                logger.info("RAG: KEV match — %s (%s %s)", hit.cve_id, hit.vendor_project, hit.product)
+        return kev_matches, kev_context
+
+    # ------------------------------------------------------------------
+    # Public query interface
+    # ------------------------------------------------------------------
+
     def query(
         self,
         findings: List[Dict[str, Any]],
         top_k: int = 3,
-    ) -> Dict[str, List[Dict]]:
+    ) -> Dict[str, Any]:
         """
         Retrieve relevant KB entries for a list of findings.
 
         Returns:
-            {"owasp": [...], "headers": [...], "remediation": [...]}
+            {
+                "owasp":       list[dict],   # OWASP Top-10 matches
+                "headers":     list[dict],   # security-header matches
+                "remediation": list[dict],   # remediation guide matches
+                "kev_matches": list[str],    # CVE IDs found in CISA KEV catalog
+                "kev_alerts":  list[str],    # pre-formatted KEV alert strings (prepend to prompt)
+            }
+
+        Existing callers that only read "owasp"/"headers"/"remediation" keys are
+        unaffected — the new keys are purely additive.
         """
         if not self._loaded:
             self.load()
 
+        # -- FAISS / keyword retrieval (unchanged) --
         if self._use_faiss:
-            return self._faiss_query(findings, top_k)
-        return self._keyword_query(findings, top_k)
+            base = self._faiss_query(findings, top_k)
+        else:
+            base = self._keyword_query(findings, top_k)
+
+        # -- KEV enrichment (additive) --
+        cve_ids = self._extract_cve_ids(findings)
+        kev_matches, kev_alerts = self._build_kev_alerts(cve_ids)
+
+        base["kev_matches"] = kev_matches
+        base["kev_alerts"] = kev_alerts
+        return base
 
     def query_single(
         self,
@@ -340,14 +432,24 @@ class RAGEngine:
 
     def format_context_for_prompt(
         self,
-        context: Dict[str, List[Dict]],
+        context: Dict[str, Any],
         max_chars: int = 3000,
     ) -> str:
         """
         Format retrieved knowledge into a compact string for LLM prompt injection.
-        Signature unchanged from v1 — callers need no updates.
+
+        KEV alerts (if any) are prepended at highest priority before all other
+        KB sections.  Callers that do not pass kev_alerts simply get the same
+        output as before — fully backward-compatible.
         """
         sections = []
+
+        # KEV alerts — highest priority, prepended first
+        kev_alerts: list[str] = context.get("kev_alerts", [])
+        if kev_alerts:
+            kev_lines = ["=== CISA KEV ALERTS (ACTIVE EXPLOITATION) ==="]
+            kev_lines.extend(kev_alerts)
+            sections.append("\n".join(kev_lines))
 
         if context.get("owasp"):
             owasp_lines = ["=== OWASP CONTEXT ==="]

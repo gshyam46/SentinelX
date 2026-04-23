@@ -77,6 +77,20 @@ sentinelX/
 - Use @ai-architect for anything in modules/ai/ and RAG design
 - Use @backend-engineer for API routes, DB models, auth, Celery
 - Use @reviewer for code review before any module is marked complete
+➤ @knowledge-engineer
+
+Purpose:
+
+KEV ingestion
+Exploit-DB parsing
+RAG structuring
+➤ @research-analyst
+
+Purpose:
+
+benchmark logging
+metadata validation (ADR-009 experiment)
+dataset consistency
 - Delegate when a task would generate large file reads or logs (keep main context clean)
 
 ## Standing Order — Always Keep Docs Current
@@ -119,5 +133,13 @@ context window.
 | modules/recon/          | @recon-engineer   |
 | Any review/audit        | @reviewer         |
 
+Updated agent mapping (strict)
+Task	Agent
+execution_graph	@pentest-engineer
+KEV / ExploitDB ingestion	@knowledge-engineer
+RAG modifications	@ai-architect
+scan metadata / research logging	@research-analyst
+API / DB changes	@backend-engineer
+validation	@reviewer
 Default behavior: if the task touches more than one file,
 delegate it. Do not read files into main context directly.

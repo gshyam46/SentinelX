@@ -38,7 +38,7 @@
 **Rationale:** Passive recon has zero legal risk (no active probing). Active scanning requires explicit authorization — paid tier implies accountability.
 **Consequence:** Tier check happens in API deps, not inside modules. The orchestrator receives `budget: int` and `allowed_tools: list[str]` (not tier string) — it is tier-agnostic. Tier-to-params computation lives in `workers/scan_tasks.py`.
 
-## ADR-007: No Follow-Up Mini-Scans (2026-04-23)
+## ADR-007: Follow-ups are prohibited from LLM.Future follow-ups will be orchestrator-driven via PTT state transitions. (2026-04-23)
 **Decision:** Removed the `follow_up_tools` / `orchestrate_mini_scan` path from the pipeline.
 **Rationale:** This path allowed Agent 2 (Analyst LLM) to indirectly trigger additional tool executions by populating `follow_up_tools` in its output. This violates ADR-001's constraint that LLM cannot control tool execution flow, even indirectly. The iteration loop added complexity without clear demo value.
 **Consequence:** `orchestrate_mini_scan` Celery task deleted. `run_analyst` always chains directly to `generate_report`. Analyst prompt no longer contains `follow_up_tools` field.
@@ -79,5 +79,37 @@
 **Rationale:** Passing only `tier` into the worker blurred the free/passive legal boundary and left the research mode architecture unwired in the live Celery path. Making the worker aware of both scan type and scan mode preserves safety while enabling the deterministic-vs-adaptive experiment in production code.
 **Consequence:** `api/v1/scans.py` and `schemas/scan.py` must carry `scan_mode` explicitly. Worker tests must assert that `scan_metadata.execution_mode` matches the requested mode. Passive scans are now guaranteed to avoid active tooling even if the caller is paid.
 
+## ADR-015: Execution Graph (implemented 2026-04-24)
+**Decision:** `modules/pentest/execution_graph.py` is a pure Python DAG that records every tool execution and finding as nodes, with directed "triggered_by" edges. `export_graph()` emits a JSON-serialisable dict that is embedded in the `scan_complete` event metadata under key `"execution_graph"`.
+**Rationale:** Transforms linear scan logs into verifiable causal attack paths — a prerequisite for NodeZero-style evidence graphs and for the deterministic-vs-adaptive research comparison.
+**Constraints:** Graph is write-only during execution (active_scan.py writes, nothing reads mid-pipeline). LLM can read the exported graph but cannot mutate graph state. No external graph library — pure Python dataclasses + dicts.
+**Consequence:** `active_scan.py` `_deterministic_scan` calls init_graph/add_tool_execution/add_finding/link_nodes/export_graph as additive instrumentation around existing tool execution — zero existing logic changed. `scan_complete` metadata now always includes `execution_graph`. Future: store execution_graph JSON in DB scan record JSONB column.
+
+
+## ADR-016: CISA KEV as High-Priority RAG Context (implemented 2026-04-24)
+**Decision:** `kev_loader.py` fetches the CISA KEV catalog (JSON feed), caches locally at
+`knowledge_base/kev_cache.json` (24h TTL), and exposes `get_cached_kev()` / `search_kev()`.
+`rag_engine.py` extracts CVE IDs from findings (regex), runs KEV lookups, and PREPENDS
+`[KEV ALERT]` strings into the context block before all other RAG sections.
+The query return dict gains two additive keys: `kev_matches: list[str]` and `kev_alerts: list[str]`.
+
+**Rationale:** A CVE that is in CISA's KEV catalog means active exploitation has been confirmed.
+That signal must outrank all other knowledge-base context in the LLM prompt — an
+actively-exploited RCE in Log4j is categorically more urgent than a generic OWASP A06 entry.
+Prepending KEV alerts gives the LLM the correct priority ordering before it reads OWASP/header context.
+
+**Constraints:** KEV data is analysis-layer only — it never influences tool selection or execution.
+`kev_cache.json` is in `.gitignore` (auto-refreshed at runtime). Network failure degrades
+gracefully to stale cache (or empty list with warning) — the rest of the pipeline proceeds.
+
+**Import resolution:** `rag_engine.py` uses a `try/except ImportError` dual-import pattern
+(`backend.modules.ai...` first, `modules.ai...` fallback) because `backend/modules/ai/__init__.py`
+uses the `backend.` prefix convention while isolated test loading uses the bare `modules.` path.
+
+**Consequence:** `RAGEngine.query()` return type broadened from `Dict[str,List[Dict]]` to
+`Dict[str,Any]` to accommodate the new string-list fields. `format_context_for_prompt()` now
+accepts the same wider type — callers that don't pass `kev_alerts` see no change.
+`kev_cache.json` added to root `.gitignore`. `knowledge_base/__init__.py` created.
+Future: wire `await load_kev_entries()` into FastAPI lifespan for eager cache warm-up.
 ---
 _Add new ADRs as decisions are made during build_
