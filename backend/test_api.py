@@ -1,122 +1,294 @@
-"""
-SentinelX - Full API End-to-End Test
-Tests: Register -> Login -> Create Scan -> Poll Results -> Tier Gating
-"""
+"""Isolated pipeline tests for scan dispatch and orchestration."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
 import sys
-import io
-import time
-import requests
-import json
+import types
+import uuid
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+import pytest
+from fastapi import HTTPException
 
-BASE = "http://localhost:8000/api/v1"
+from backend.api.v1.scans import create_scan
+from backend.schemas.scan import ScanRequest
+from backend.workers import scan_tasks
 
-def test_full_flow():
-    print("\n" + "="*60)
-    print("  SentinelX API End-to-End Test")
-    print("="*60)
 
-    # 1. Health check
-    print("\n[1] Health check...")
-    r = requests.get(f"{BASE}/health")
-    assert r.status_code == 200, f"Health check failed: {r.status_code}"
-    print(f"    OK: {r.json()}")
+class _ScalarResult:
+    def __init__(self, value: int) -> None:
+        self._value = value
 
-    # 2. Register
-    print("\n[2] Register new user...")
-    r = requests.post(f"{BASE}/auth/register", json={
-        "email": "test@sentinelx.io",
-        "password": "TestPass123!",
-        "full_name": "Test User"
-    })
-    if r.status_code == 409:
-        print("    User exists, logging in instead...")
-        r = requests.post(f"{BASE}/auth/login", json={
-            "email": "test@sentinelx.io",
-            "password": "TestPass123!"
-        })
-    assert r.status_code in (200, 201), f"Auth failed: {r.status_code} {r.text}"
-    data = r.json()
-    token = data["access_token"]
-    user = data["user"]
-    print(f"    OK: User {user['email']} (tier: {user['tier']})")
-    print(f"    Token: {token[:40]}...")
+    def scalar(self) -> int:
+        return self._value
 
-    headers = {"Authorization": f"Bearer {token}"}
 
-    # 3. Get profile
-    print("\n[3] Get profile (GET /auth/me)...")
-    r = requests.get(f"{BASE}/auth/me", headers=headers)
-    assert r.status_code == 200, f"Profile failed: {r.status_code} {r.text}"
-    print(f"    OK: {r.json()['email']}")
+class _FakeDbSession:
+    def __init__(self) -> None:
+        self.added: list[object] = []
 
-    # 4. Create passive scan
-    print("\n[4] Create passive scan (POST /scans)...")
-    r = requests.post(f"{BASE}/scans", headers=headers, json={
-        "domain": "example.com",
-        "scan_type": "passive"
-    })
-    assert r.status_code == 201, f"Scan create failed: {r.status_code} {r.text}"
-    scan = r.json()
-    scan_id = scan["id"]
-    print(f"    OK: Scan {scan_id[:8]}... created (status: {scan['status']})")
+    async def execute(self, statement) -> _ScalarResult:  # noqa: ANN001
+        return _ScalarResult(0)
 
-    # 5. Poll scan until complete
-    print("\n[5] Polling scan status...")
-    max_polls = 30
-    final_status = "pending"
-    for i in range(max_polls):
-        time.sleep(3)
-        r = requests.get(f"{BASE}/scans/{scan_id}", headers=headers)
-        assert r.status_code == 200
-        scan = r.json()
-        final_status = scan["status"]
-        progress = scan["progress"]
-        step = scan.get("current_step") or ""
-        print(f"    [{i+1:2d}] {final_status} | {progress}% | {step}")
-        if final_status in ("complete", "failed"):
-            break
+    def add(self, value: object) -> None:
+        self.added.append(value)
 
-    if final_status == "complete":
-        print(f"\n    --- SCAN COMPLETE ---")
-        print(f"    Findings: {scan['findings_count']}")
-        print(f"    Critical: {scan['critical_count']}  High: {scan['high_count']}  "
-              f"Medium: {scan['medium_count']}  Low: {scan['low_count']}  Info: {scan['info_count']}")
-        print(f"    Risk Score: {scan['risk_score']}")
+    async def commit(self) -> None:
+        return None
 
-        results = scan.get("results") or {}
-        findings = results.get("all_findings", [])
-        if findings:
-            print(f"\n    Sample findings:")
-            for f in findings[:3]:
-                print(f"      [{f.get('severity','?').upper()}] {f.get('title','N/A')}")
+    async def refresh(self, scan) -> None:  # noqa: ANN001
+        if getattr(scan, "id", None) is None:
+            scan.id = uuid.uuid4()
+        if getattr(scan, "created_at", None) is None:
+            scan.created_at = datetime.now(timezone.utc)
+        scan.completed_at = getattr(scan, "completed_at", None)
+        scan.progress = getattr(scan, "progress", 0) or 0
+        scan.current_step = getattr(scan, "current_step", None)
 
-        if results.get("gated"):
-            print(f"\n    FREE TIER GATING: {results.get('hidden_findings_count',0)} findings hidden")
-            print(f"    Upgrade: {results.get('upgrade_message','')[:80]}...")
-    elif final_status == "failed":
-        print(f"    FAILED: {scan.get('error_message', 'Unknown')}")
 
-    # 6. List scans
-    print("\n[6] List scan history...")
-    r = requests.get(f"{BASE}/scans", headers=headers)
-    assert r.status_code == 200
-    print(f"    OK: {r.json()['total']} scan(s) in history")
+class _FakeFinding:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
 
-    # 7. Active scan blocked for free tier
-    print("\n[7] Test tier gating (active scan blocked)...")
-    r = requests.post(f"{BASE}/scans", headers=headers, json={
-        "domain": "example.com",
-        "scan_type": "active",
-        "authorization_confirmed": True
-    })
-    assert r.status_code == 403, f"Expected 403, got {r.status_code}"
-    print(f"    OK: Correctly blocked - {r.json()['detail'][:60]}...")
+    def to_dict(self) -> dict:
+        return dict(self._payload)
 
-    print("\n" + "="*60)
-    print("  ALL TESTS PASSED")
-    print("="*60 + "\n")
 
-if __name__ == "__main__":
-    test_full_flow()
+class _FakeEvent:
+    def __init__(
+        self,
+        event_type: str,
+        *,
+        tool: str | None = None,
+        finding: _FakeFinding | None = None,
+        budget_remaining: int = 0,
+        metadata: dict | None = None,
+    ) -> None:
+        self.type = event_type
+        self.tool = tool
+        self.finding = finding
+        self.budget_remaining = budget_remaining
+        self.metadata = metadata
+
+    def to_dict(self) -> dict:
+        return {
+            "type": self.type,
+            "tool": self.tool,
+            "finding": self.finding.to_dict() if self.finding else None,
+            "budget_remaining": self.budget_remaining,
+            "metadata": self.metadata or {},
+        }
+
+
+@pytest.mark.asyncio
+async def test_create_scan_dispatches_requested_scan_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    delay_calls: list[tuple[str, str, str, str, str]] = []
+
+    monkeypatch.setattr(
+        scan_tasks.orchestrate_scan,
+        "delay",
+        lambda scan_id, domain, tier, scan_type, mode: delay_calls.append(
+            (scan_id, domain, tier, scan_type, mode)
+        ),
+    )
+
+    request = ScanRequest(
+        domain="https://www.example.com/",
+        scan_type="active",
+        scan_mode="deterministic",
+        authorization_confirmed=True,
+    )
+    db = _FakeDbSession()
+    current_user = types.SimpleNamespace(
+        id=uuid.uuid4(),
+        tier="pro",
+        scan_count=0,
+    )
+
+    response = await create_scan(request, db=db, current_user=current_user)
+
+    assert response.domain == "example.com"
+    assert response.scan_type == "active"
+    assert delay_calls == [
+        (str(response.id), "example.com", "pro", "active", "deterministic")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_scan_blocks_free_active_requests() -> None:
+    request = ScanRequest(
+        domain="example.com",
+        scan_type="active",
+        scan_mode="adaptive",
+        authorization_confirmed=True,
+    )
+    db = _FakeDbSession()
+    current_user = types.SimpleNamespace(
+        id=uuid.uuid4(),
+        tier="free",
+        scan_count=0,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_scan(request, db=db, current_user=current_user)
+
+    assert exc_info.value.status_code == 403
+
+
+def test_orchestrate_scan_pipeline_runs_requested_mode_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_mode = "deterministic"
+    scan_id = str(uuid.uuid4())
+
+    task_updates: list[tuple[str, dict]] = []
+    redis_events: list[tuple[str, dict]] = []
+    db_events: list[tuple[str, object]] = []
+    analyst_calls: list[str] = []
+    active_scan_calls: list[dict] = []
+
+    async def fake_run_active_scan(  # noqa: ANN202
+        *,
+        target: str,
+        scan_id: uuid.UUID,
+        budget: int,
+        allowed_tools: list[str],
+        mode: str,
+    ):
+        active_scan_calls.append(
+            {
+                "target": target,
+                "scan_id": scan_id,
+                "budget": budget,
+                "allowed_tools": allowed_tools,
+                "mode": mode,
+            }
+        )
+        finding = _FakeFinding(
+            {
+                "title": "Mock finding",
+                "severity": "high",
+                "description": "Synthetic pipeline finding",
+                "target": target,
+                "source_tool": "nuclei",
+                "owasp_categories": ["A05"],
+            }
+        )
+        yield _FakeEvent("tool_started", tool="nuclei", budget_remaining=3)
+        yield _FakeEvent("finding", tool="nuclei", finding=finding, budget_remaining=2)
+        yield _FakeEvent(
+            "tool_complete",
+            tool="nuclei",
+            budget_remaining=2,
+            metadata={"owasp_coverage": ["A05"]},
+        )
+        yield _FakeEvent(
+            "scan_complete",
+            budget_remaining=2,
+            metadata={
+                "execution_mode": mode,
+                "owasp_coverage": ["A05"],
+                "tool_timings": [{"tool": "nuclei", "duration_s": 0.01}],
+            },
+        )
+
+    fake_active_scan_module = types.ModuleType("backend.modules.pentest.active_scan")
+    fake_active_scan_module.run_active_scan = fake_run_active_scan
+    monkeypatch.setitem(sys.modules, "backend.modules.pentest.active_scan", fake_active_scan_module)
+
+    fake_analyst_module = types.ModuleType("backend.workers.analyst_tasks")
+    fake_analyst_module.run_analyst = types.SimpleNamespace(delay=lambda value: analyst_calls.append(value))
+    monkeypatch.setitem(sys.modules, "backend.workers.analyst_tasks", fake_analyst_module)
+
+    monkeypatch.setattr(scan_tasks, "_scan_params_for_tier", lambda tier: (3, ["nuclei", "zap"]))
+    monkeypatch.setattr(
+        scan_tasks.orchestrate_scan,
+        "update_state",
+        lambda *, state, meta: task_updates.append((state, meta)),
+    )
+    monkeypatch.setattr(
+        scan_tasks,
+        "_sync_redis_publish",
+        lambda channel, payload: redis_events.append((channel, payload)),
+    )
+
+    async def fake_db_set_scan_running(value: uuid.UUID) -> None:
+        db_events.append(("running", value))
+
+    async def fake_db_update_tool_started(value: uuid.UUID, tool: str, budget_remaining: int) -> None:
+        db_events.append(("tool_started", {"scan_id": value, "tool": tool, "budget_remaining": budget_remaining}))
+
+    async def fake_db_append_finding(value: uuid.UUID, finding_dict: dict) -> None:
+        db_events.append(("finding", {"scan_id": value, "finding": finding_dict}))
+
+    async def fake_db_complete_scan(value: uuid.UUID, metadata: dict, tools_run: list[str]) -> None:
+        db_events.append(
+            (
+                "complete",
+                {
+                    "scan_id": value,
+                    "metadata": metadata,
+                    "tools_run": tools_run,
+                },
+            )
+        )
+
+    async def fake_db_fail_scan(value: uuid.UUID, error: str) -> None:
+        db_events.append(("failed", {"scan_id": value, "error": error}))
+
+    monkeypatch.setattr(scan_tasks, "_db_set_scan_running", fake_db_set_scan_running)
+    monkeypatch.setattr(scan_tasks, "_db_update_tool_started", fake_db_update_tool_started)
+    monkeypatch.setattr(scan_tasks, "_db_append_finding", fake_db_append_finding)
+    monkeypatch.setattr(scan_tasks, "_db_complete_scan", fake_db_complete_scan)
+    monkeypatch.setattr(scan_tasks, "_db_fail_scan", fake_db_fail_scan)
+
+    result = scan_tasks.orchestrate_scan.run(
+        scan_id,
+        "example.com",
+        "pro",
+        "active",
+        requested_mode,
+    )
+
+    assert active_scan_calls == [
+        {
+            "target": "example.com",
+            "scan_id": uuid.UUID(scan_id),
+            "budget": 3,
+            "allowed_tools": ["nuclei", "zap"],
+            "mode": requested_mode,
+        }
+    ]
+    assert result == {
+        "tools_run": ["nuclei"],
+        "findings_count": 1,
+        "scan_metadata": {
+            "execution_mode": requested_mode,
+            "owasp_coverage": ["A05"],
+            "tool_timings": [{"tool": "nuclei", "duration_s": 0.01}],
+        },
+    }
+    assert analyst_calls == [scan_id]
+    assert ("running", uuid.UUID(scan_id)) in db_events
+    assert any(event[0] == "finding" for event in db_events)
+    assert any(event[0] == "complete" for event in db_events)
+    assert task_updates[-1] == (
+        "PROGRESS",
+        {
+            "step": "Scan complete - queuing analyst",
+            "mode": requested_mode,
+            "budget_remaining": 2,
+            "findings_count": 1,
+        },
+    )
+    assert redis_events[-1] == (
+        f"scan:{scan_id}:events",
+        {
+            "type": "orchestration_complete",
+            "scan_id": scan_id,
+            "scan_type": "active",
+            "mode": requested_mode,
+            "findings_count": 1,
+            "tools_run": ["nuclei"],
+        },
+    )

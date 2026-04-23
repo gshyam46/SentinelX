@@ -12,6 +12,7 @@ import re
 class ScanRequest(BaseModel):
     domain: str = Field(..., min_length=3, max_length=255)
     scan_type: str = Field(default="passive", pattern="^(passive|active|full)$")
+    scan_mode: str = Field(default="adaptive", pattern="^(deterministic|adaptive)$")
     authorization_confirmed: bool = False
 
     @field_validator("domain")

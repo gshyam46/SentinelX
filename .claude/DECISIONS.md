@@ -74,5 +74,10 @@
 **Rationale:** CLI mode is simpler, stateless, and works reliably for one-shot scans. Daemon mode adds complexity but enables real-time progress and parallel scans — appropriate for production but not V1 demo.
 **Consequence:** ZAP is in the deep and web_vapt scan profiles. Active scan is paid-tier only (it probes the target). Passive scan (spider only) could be free tier in future.
 
+## ADR-014: Scan Task Boundary Carries Scan Type + Scan Mode (2026-04-24)
+**Decision:** `workers/scan_tasks.py` is the execution boundary that receives both `scan_type` and `scan_mode`. Passive scans route through `modules/recon/passive_recon.py`. Active and full scans route through `modules/pentest/active_scan.py` with `scan_mode="deterministic" | "adaptive"`.
+**Rationale:** Passing only `tier` into the worker blurred the free/passive legal boundary and left the research mode architecture unwired in the live Celery path. Making the worker aware of both scan type and scan mode preserves safety while enabling the deterministic-vs-adaptive experiment in production code.
+**Consequence:** `api/v1/scans.py` and `schemas/scan.py` must carry `scan_mode` explicitly. Worker tests must assert that `scan_metadata.execution_mode` matches the requested mode. Passive scans are now guaranteed to avoid active tooling even if the caller is paid.
+
 ---
 _Add new ADRs as decisions are made during build_

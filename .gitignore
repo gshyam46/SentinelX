@@ -4,6 +4,9 @@
 .env.local
 .env.production
 
+#claude
+.claude
+
 # Python
 __pycache__/
 *.py[cod]

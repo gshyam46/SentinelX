@@ -172,10 +172,20 @@ async def create_scan(
     try:
         from backend.workers.scan_tasks import orchestrate_scan  # lazy — avoids circular at module load
 
-        orchestrate_scan.delay(str(scan.id), data.domain, tier)
+        orchestrate_scan.delay(
+            str(scan.id),
+            data.domain,
+            tier,
+            data.scan_type,
+            data.scan_mode,
+        )
         logger.info(
-            "[%s] Dispatched orchestrate_scan for domain=%s tier=%s",
-            scan.id, data.domain, tier,
+            "[%s] Dispatched orchestrate_scan for domain=%s tier=%s scan_type=%s mode=%s",
+            scan.id,
+            data.domain,
+            tier,
+            data.scan_type,
+            data.scan_mode,
         )
     except Exception as exc:
         # Celery unavailable — mark scan as failed immediately
