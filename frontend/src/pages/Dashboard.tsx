@@ -22,6 +22,7 @@ export default function Dashboard() {
   const navigate = useNavigate()
   const [domain, setDomain] = useState('')
   const [scanType, setScanType] = useState<ScanType>('passive')
+  const [scanMode, setScanMode] = useState<'deterministic' | 'adaptive'>('deterministic')
   const [authConfirmed, setAuthConfirmed] = useState(false)
   const [isLaunching, setIsLaunching] = useState(false)
   const [scans, setScans] = useState<ScanStatusResponse[]>(DEMO_SCANS)
@@ -64,6 +65,7 @@ export default function Dashboard() {
       const scan = await api.createScan({
         domain: domain.trim(),
         scan_type: scanType,
+        scan_mode: scanType !== 'passive' ? scanMode : undefined,
         authorization_confirmed: authConfirmed,
       })
       navigate(`/scans/${scan.id}`)
@@ -215,6 +217,33 @@ export default function Dashboard() {
               )
             })}
           </div>
+
+          {/* Scan mode select — shown for active/full only */}
+          {scanType !== 'passive' && (
+            <div className="flex items-center gap-3 mb-4">
+              <span className="text-xs font-semibold" style={{ color: '#6B7280', minWidth: 80 }}>
+                Scan Mode
+              </span>
+              {(['deterministic', 'adaptive'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setScanMode(mode)}
+                  className="px-3 py-1.5 rounded text-xs font-semibold capitalize transition-all"
+                  style={{
+                    background: scanMode === mode ? 'rgba(139,92,246,0.12)' : 'rgba(17,24,39,0.6)',
+                    border: scanMode === mode ? '1px solid rgba(139,92,246,0.4)' : '1px solid #1F2937',
+                    color: scanMode === mode ? '#A78BFA' : '#6B7280',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {mode}
+                </button>
+              ))}
+              <span className="text-xs" style={{ color: '#4B5563' }}>
+                {scanMode === 'adaptive' ? 'LLM selects tools dynamically' : 'Fixed tool sequence, no LLM'}
+              </span>
+            </div>
+          )}
 
           {/* Domain input row */}
           <div className="flex gap-3 items-start">

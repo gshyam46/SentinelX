@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.config import get_settings
 from backend.api.router import api_router
 from backend.db.session import init_db, close_db
+from backend.modules.ai.knowledge_base.kev_loader import load_kev_entries
 
 settings = get_settings()
 
@@ -37,6 +38,13 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"⚠️  Database init skipped (not connected): {e}")
     
+    # Pre-warm KEV catalog cache — failure must never block startup
+    try:
+        entries = await load_kev_entries()
+        logger.info("KEV pre-warm loaded %d entries", len(entries))
+    except Exception as exc:
+        logger.warning("KEV pre-warm skipped: %s", exc)
+
     logger.info("🚀 SentinelX is ready")
     yield
     

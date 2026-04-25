@@ -40,9 +40,14 @@ def _load_analyst_module():
     # Stub out backend.modules.ai.rag_engine so the module-level import
     # `from backend.modules.ai.rag_engine import get_rag_engine` succeeds.
     fake_rag = MagicMock()
-    fake_rag.query.return_value = {"chunks": [], "kev_matches": [], "kev_alerts": []}
+    fake_rag.query.return_value = {
+        "chunks": [], "kev_matches": [], "kev_alerts": [],
+        "owasp": [], "headers": [], "remediation": [],
+        "exploit_db": [], "cve_summaries": [], "kev_catalog": [],
+    }
     fake_rag.format_context_for_prompt.return_value = ""
     fake_rag.get_retrieval_method.return_value = "keyword"
+    fake_rag._kb = {"exploit_db": []}
 
     rag_module = types.ModuleType("backend.modules.ai.rag_engine")
     rag_module.get_rag_engine = lambda: fake_rag
@@ -178,7 +183,7 @@ class TestAnalyzeKevNotes:
                 return_value=_mock_llm_response(notes=llm_notes),
             ):
                 return await self.agent.analyze(_SCAN_RESULTS, kev_matches=kev_matches)
-        return asyncio.get_event_loop().run_until_complete(_inner())
+        return asyncio.run(_inner())
 
     def test_no_kev_leaves_notes_unchanged(self):
         report = self._run([])
@@ -224,11 +229,13 @@ class TestAnalyzeFindingsSignature:
         assert "scan_results" in params
         assert "kev_matches" in params
 
-    def test_kev_matches_defaults_to_empty_list(self):
+    def test_kev_matches_defaults_to_none(self):
+        """kev_matches default is None (not []) to avoid the mutable default bug.
+        The module resolves None to [] internally before use."""
         import inspect
         sig = inspect.signature(analyze_findings)
         default = sig.parameters["kev_matches"].default
-        assert default == []
+        assert default is None
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +272,7 @@ class TestSchemaUnchanged:
                 return_value=_mock_llm_response(),
             ):
                 return await agent.analyze(_SCAN_RESULTS, kev_matches=_KEV_IDS)
-        return asyncio.get_event_loop().run_until_complete(_inner())
+        return asyncio.run(_inner())
 
     def test_all_required_fields_present_with_kev(self):
         report = self._run_with_kev()
@@ -274,10 +281,17 @@ class TestSchemaUnchanged:
 
     def test_no_unexpected_new_top_level_fields(self):
         """Ensure no brand-new top-level keys appeared that aren't in the
-        known schema. kev_matches was added in a prior session and is
-        intentionally allowed here."""
+        known schema. kev_matches was added in ADR-018; known_exploited,
+        exploit_available, priority_reason were added in ADR-020."""
         report = self._run_with_kev()
-        known_fields = self._REQUIRED_FIELDS | {"kev_matches", "model_used"}
+        known_fields = self._REQUIRED_FIELDS | {
+            "kev_matches",
+            "model_used",
+            # ADR-020 intelligence correlation fields
+            "known_exploited",
+            "exploit_available",
+            "priority_reason",
+        }
         unexpected = set(report.keys()) - known_fields
         assert not unexpected, f"Unexpected new fields in report: {unexpected}"
 

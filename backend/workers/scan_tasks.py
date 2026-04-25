@@ -227,8 +227,24 @@ async def _db_complete_scan(scan_id: uuid.UUID, metadata: dict, tools_run: list[
             "execution_graph_present": execution_graph_present,
         }
 
+        # Size guard — warn if the graph payload is unexpectedly large,
+        # but never fail the scan over it.
+        if execution_graph:
+            graph_bytes = len(json.dumps(execution_graph, default=str))
+            if graph_bytes > 500_000:  # 500 KB threshold
+                logger.warning(
+                    "execution_graph size %d bytes exceeds 500KB threshold for scan %s",
+                    graph_bytes,
+                    scan_id,
+                )
+
         existing = scan.results or {}
-        scan.results = {**existing, "tools_run": tools_run, "scan_metadata": persisted_metadata}
+        scan.results = {
+            **existing,
+            "tools_run": tools_run,
+            "scan_metadata": persisted_metadata,
+            "execution_graph": execution_graph,  # None for passive scans — JSONB-safe
+        }
 
         risk = min(
             100,
@@ -512,17 +528,25 @@ def orchestrate_scan(
                 )
             )
             active_meta = active_result["scan_metadata"]
+            full_scan_metadata: dict = {
+                **active_meta,
+                "scan_type": "full",
+                "passive_phase": passive_result["scan_metadata"],
+                "active_phase": active_meta,
+            }
+            # ADR-018: promote execution_graph from active_phase to top level so
+            # _db_complete_scan can find it via metadata.get("execution_graph").
+            # execution_graph is intentionally kept in active_phase as well so
+            # consumers reading the nested structure are unaffected.
+            active_phase = full_scan_metadata.get("active_phase") or {}
+            if "execution_graph" in active_phase:
+                full_scan_metadata["execution_graph"] = active_phase["execution_graph"]
             result = {
                 "tools_run": list(
                     dict.fromkeys(passive_result["tools_run"] + active_result["tools_run"])
                 ),
                 "findings_count": passive_result["findings_count"] + active_result["findings_count"],
-                "scan_metadata": {
-                    **active_meta,
-                    "scan_type": "full",
-                    "passive_phase": passive_result["scan_metadata"],
-                    "active_phase": active_meta,
-                },
+                "scan_metadata": full_scan_metadata,
             }
         else:
             result = asyncio.run(

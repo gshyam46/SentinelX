@@ -35,6 +35,24 @@ export interface ScanStatusResponse {
   completed_at?: string
 }
 
+export interface ExecutionGraphNode {
+  id: string
+  type: 'tool_execution' | 'finding'
+  data: Record<string, unknown>
+}
+
+export interface ExecutionGraphEdge {
+  id: string
+  source: string
+  target: string
+  relationship?: string
+}
+
+export interface ExecutionGraph {
+  nodes: ExecutionGraphNode[]
+  edges: ExecutionGraphEdge[]
+}
+
 export interface ScanResultResponse extends ScanStatusResponse {
   results?: {
     findings?: Finding[]
@@ -54,6 +72,9 @@ export interface ScanResultResponse extends ScanStatusResponse {
   info_count: number
   risk_score: number
   error_message?: string
+  execution_graph?: ExecutionGraph | null
+  execution_graph_present?: boolean
+  kev_matches?: string[]
 }
 
 export interface ScanListResponse {
@@ -107,6 +128,7 @@ export interface RemediationItem {
 export interface ScanCreateRequest {
   domain: string
   scan_type: ScanType
+  scan_mode?: 'deterministic' | 'adaptive'
   authorization_confirmed: boolean
 }
 
@@ -207,6 +229,11 @@ export const api = {
   async getScanReport(id: string): Promise<AnalysisReport> {
     const res = await http.get<AnalysisReport>(`/scans/${id}/report`)
     return res.data
+  },
+
+  async downloadScanPdf(id: string): Promise<Blob> {
+    const res = await http.get(`/scans/${id}/pdf-report`, { responseType: 'blob' })
+    return res.data as Blob
   },
 
   // Health

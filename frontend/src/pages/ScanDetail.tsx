@@ -14,6 +14,7 @@ import { severityColor, riskColor, formatRelativeTime } from '@/lib/utils'
 import RiskGauge from '@/components/RiskGauge'
 import LiveAgentFeed from '@/components/LiveAgentFeed'
 import FindingRow from '@/components/FindingRow'
+import ExecutionGraph from '@/components/ExecutionGraph'
 
 // ── OWASP radar data helpers ──────────────────────────────────────────
 const OWASP_CATS = ['A01','A02','A03','A04','A05','A06','A07','A08','A09','A10']
@@ -96,7 +97,8 @@ export default function ScanDetail() {
   const [liveFindings, setLiveFindings] = useState<Finding[]>([])
   const [newFindingIds, setNewFindingIds] = useState<Set<number>>(new Set())
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<'findings'|'chains'>('findings')
+  const [activeTab, setActiveTab] = useState<'findings'|'chains'|'graph'>('findings')
+  const [pdfDownloading, setPdfDownloading] = useState(false)
   const newFindingTimer = useRef<ReturnType<typeof setTimeout>|null>(null)
 
   // ── Initial load ───────────────────────────────────────────────────
@@ -166,6 +168,24 @@ export default function ScanDetail() {
       setLiveFindings(data.results?.findings ?? [])
       if (rep) setReport(rep)
     } catch { /* ignore */ }
+  }
+
+  async function handlePdfDownload() {
+    if (!scanId || pdfDownloading) return
+    setPdfDownloading(true)
+    try {
+      const blob = await api.downloadScanPdf(scanId)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `sentinelx-report-${scanId}.pdf`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch {
+      // silently fail — user will see no download
+    } finally {
+      setPdfDownloading(false)
+    }
   }
 
   const isRunning = scan?.status === 'running' || scan?.status === 'pending'
@@ -242,6 +262,24 @@ export default function ScanDetail() {
         )}
 
         <div className="flex-1" />
+
+        {/* PDF download button — shown when complete */}
+        {scan.status === 'complete' && (
+          <button
+            onClick={handlePdfDownload}
+            disabled={pdfDownloading}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all"
+            style={{
+              background: 'rgba(34,197,94,0.08)',
+              border: '1px solid rgba(34,197,94,0.2)',
+              color: '#22C55E',
+              cursor: pdfDownloading ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {pdfDownloading ? <RefreshCw size={11} className="spin" /> : <TrendingUp size={11} />}
+            {pdfDownloading ? 'Generating…' : 'PDF Report'}
+          </button>
+        )}
 
         {/* Status badge */}
         <span className={`badge badge-${scan.status}`}>{scan.status.toUpperCase()}</span>
@@ -400,6 +438,12 @@ export default function ScanDetail() {
                     <AttackChainCard key={i} chain={chain} idx={i} />
                   ))
                 )}
+              </div>
+            )}
+
+            {activeTab === 'graph' && (
+              <div className="p-5">
+                <ExecutionGraph graphData={scan?.execution_graph ?? null} />
               </div>
             )}
           </div>

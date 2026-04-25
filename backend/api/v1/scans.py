@@ -27,6 +27,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -473,6 +474,74 @@ async def get_scan_report(
         follow_up_tools=ai_report.get("follow_up_tools") if is_pro else None,
         model_used=ai_report.get("model_used") if is_pro else None,
         generated_at=ai_report.get("generated_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /scans/{scan_id}/pdf-report — PDF binary download (paid tier only)
+# ---------------------------------------------------------------------------
+
+@router.get("/{scan_id}/pdf-report")
+async def download_scan_pdf(
+    scan_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Generate and stream a PDF report for the scan.
+
+    - Requires paid tier (pro/enterprise).
+    - Returns 404 if scan not found or analysis not yet complete.
+    - Returns 403 if scan belongs to a different user.
+    """
+    tier = _user_tier(current_user)
+    if tier == "free":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="PDF reports require a paid subscription.",
+        )
+
+    result = await db.execute(
+        select(Scan).where(Scan.id == scan_id)
+    )
+    scan = result.scalar_one_or_none()
+
+    if not scan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found.")
+
+    if scan.user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    if scan.status != "complete":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report not available — scan has not completed yet.",
+        )
+
+    scan_result = {
+        "target": scan.domain,
+        "domain": scan.domain,
+        "created_at": scan.created_at.isoformat() if scan.created_at else "",
+        "risk_score": scan.risk_score,
+        "findings": (scan.results or {}).get("findings", []),
+        "ai_report": (scan.results or {}).get("ai_report", {}),
+    }
+
+    try:
+        from backend.modules.report.report_generator import generate_report
+        pdf_bytes = generate_report(str(scan_id), scan_result)
+    except Exception as exc:
+        logger.error("[%s] PDF generation failed: %s", scan_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate PDF report.",
+        )
+
+    filename = f"sentinelx-report-{scan.domain}-{scan_id}.pdf"
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

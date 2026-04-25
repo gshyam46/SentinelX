@@ -130,11 +130,16 @@ def _sync_db_run(coro_factory, *, max_retries: int = 3, base_delay: float = 0.5)
 
 def _sync_redis_publish(channel: str, payload: dict) -> None:
     try:
-        import redis as sync_redis
+        import redis.asyncio as aioredis
 
-        r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
-        r.publish(channel, json.dumps(payload))
-        r.close()
+        async def _publish() -> None:
+            r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            try:
+                await r.publish(channel, json.dumps(payload))
+            finally:
+                await r.aclose()
+
+        asyncio.run(_publish())
     except Exception as exc:  # noqa: BLE001
         logger.debug("Analyst Redis publish skipped: %s", exc)
 
@@ -147,6 +152,7 @@ def _sync_redis_publish(channel: str, payload: dict) -> None:
     name="run_analyst",
     track_started=True,
     acks_late=True,
+    queue="analyst",
 )
 def run_analyst(scan_id: str) -> dict:
     """

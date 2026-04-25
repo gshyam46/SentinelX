@@ -21,7 +21,24 @@ build/
 .venv/
 venv/
 env/
+# Env files
+.env
+.env.*
+*.env
 
+# Claude AI files
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Build
+dist/
+build/
 # Node
 node_modules/
 frontend/dist/

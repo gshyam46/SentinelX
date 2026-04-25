@@ -1,128 +1,123 @@
 # SentinelX — Claude Code Master Config
 
 ## Project Identity
+AI-driven security decision engine: external black-box pentesting + LLM security analysis + internal VAPT+SOC.
+**Stack:** FastAPI (Python 3.11+) · PostgreSQL 16 (asyncpg) · Redis 7 + Celery · React + Vite + React Flow · Docker
+**Deploy target:** Ubuntu 22.04 — Nmap, Nuclei, ZAP as system binaries
+**Dev environment:** Windows — MOCK_MODE=true for all tool wrappers
 
-Full-stack AI-powered cybersecurity assessment platform.
-**Stack:** FastAPI (Python 3.11+) · PostgreSQL 16 (asyncpg) · Redis + Celery · React/Vite · Docker
-**Target Deploy:** Ubuntu 22.04 Linux (all security tools pre-installed as system binaries)
-**Dev Env:** Windows (mock mode for native tools like Nuclei/Nmap/Gobuster)
-**Build Phase:** V1 Demo — production-grade quality, no shortcuts
+---
+
+## Session Startup (mandatory every session)
+
+1. Read `PROGRESS.md` — restore active phase and task state
+2. Confirm which Phase 1.5 task you are on before writing any code
+3. Delegate to correct agent (see table below)
+4. On session end: update `PROGRESS.md` and `DECISIONS.md`
+
+---
+
+## Phase Status
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Backend core, passive recon, active scan, AI analyst, execution graph, KEV/RAG | ✅ COMPLETE |
+| 1.5 | Docker prod, Alembic, W2/W5/W6 fixes, React UI, PDF report, Linux E2E validation | 🔧 ACTIVE |
+| 2 | Validation layer, PTT, chained attack paths, Find→Fix→Verify, authenticated scan | ⬜ QUEUED |
+| 3 | LLM security module (OWASP LLM Top 10) | ⬜ QUEUED |
+| 4 | SIEM module | ⬜ QUEUED |
+| 5 | VAPT+SOC with code access | ⬜ QUEUED |
+
+**ADR-026 gate:** Do not start Phase 2 until Phase 1.5 end condition is met (see PROGRESS.md).
+
+---
 
 ## Critical Architecture Rules (Never Violate)
 
+1. LLM recommends tools only from code-enforced `ALLOWED_TOOLS` — never executes tools directly
+2. All tool dispatch via `_execute_tool()` → `OPERATIONAL_REGISTRY` in `tool_registry.py`
+3. LLM only interprets structured JSON tool output — never discovers vulnerabilities
+4. All LLM outputs validated via Pydantic before use or storage
+5. Passive scans never touch active tooling — enforced in `scan_tasks.py` worker boundary (not just API)
+6. KEV data is analysis-layer only — never influences tool selection or execution
+7. Phase 2 follow-ups: PTT state-transition model only (orchestrator acts on PTT state; LLM updates state)
+8. Validation layer (Phase 2): confirms findings only, never performs destructive exploitation
+9. Attack chains derived from execution graph DAG edges only — no inference from finding text
+10. `_KEV_SYSTEM_PROMPT_BLOCK` appended to base prompt only when kev_matches non-empty — never replaces base prompt
 
+---
 
-1. AI (LLM) MAY recommend tool selection in adaptive mode, but execution is strictly enforced by Python allowlists (`TOOL_REGISTRY` + `OPERATIONAL_REGISTRY`)
-2. LLM NEVER executes tools, introduces new tools, or bypasses constraints
-3. LLM ONLY interprets structured JSON tool outputs — it never performs vulnerability discovery
-4. Agent 1 (Orchestrator) = deterministic + constrained adaptive controller(LLM-guided, Python-enforced)
-5. Agent 2 (Analyst) + Agent 3 (Remediation) = LLM + RAG, strict prompt boundaries
-6. All LLM outputs must pass Pydantic validation before use
-7. Tier-gating enforced at API layer: free = passive recon only, paid = active scan + AI report
-8. LLM cannot trigger follow-up scans or additional tool executions (future handled via orchestrator-driven PTT only)
+## Agent Delegation (strict — never load multiple large files in main context)
+
+| Task involves | Delegate to |
+|---|---|
+| api/, models/, schemas/, workers/, Docker, Alembic, Redis/aioredis | @backend-engineer |
+| modules/pentest/, tool_registry, active_scan, execution_graph, validation/ (Ph2) | @pentest-engineer |
+| modules/ai/, RAG, analyst_agent, remediation_agent, llm_security/ (Ph3) | @ai-architect |
+| modules/recon/ | @recon-engineer |
+| frontend/, React, React Flow, PDF report | @frontend-engineer |
+| KEV/ExploitDB/NVD KB ingestion, fetch scripts | @knowledge-engineer |
+| ADR-009 benchmark data, research metadata logging | @research-analyst |
+| All audits, E2E validation | @reviewer |
+
+**Rule:** Task touches more than one file → delegate.
+
+---
 
 ## Directory Map
 
 ```
 sentinelX/
 ├── CLAUDE.md                    ← YOU ARE HERE
-├── .claude/
-│   ├── PROGRESS.md              ← Session state tracker (read this every session)
-│   ├── agents/                  ← Sub-agent definitions
-│   └── DECISIONS.md             ← Architecture decisions log
+├── ARCHITECTURE.md              ← System design + data flows + phase roadmap
+├── PROGRESS.md                  ← Task board, phase status, known issues, session log
+├── DECISIONS.md                 ← ADR log (ADR-001 through ADR-026+)
 ├── backend/
-│   ├── main.py                  ← FastAPI factory + lifespan
-│   ├── config.py                ← Pydantic-settings config
-│   ├── api/v1/                  ← auth.py, scans.py, health.py
-│   ├── models/                  ← SQLAlchemy ORM (user.py, scan.py)
-│   ├── schemas/                 ← Pydantic I/O models
+│   ├── main.py                  # FastAPI factory + lifespan (KEV pre-warm)
+│   ├── config.py                # MOCK_MODE, SYNC_DATABASE_URL, API keys
+│   ├── api/v1/                  # auth.py, scans.py (+/report Ph1.5), health.py
+│   ├── db/session.py            # Async SQLAlchemy engine
+│   ├── models/                  # user.py, scan.py (ORM)
+│   ├── schemas/                 # user.py, scan.py (Pydantic I/O)
 │   ├── modules/
-│   │   ├── recon/               ← ✅ COMPLETE passive recon engine
-│   │   ├── pentest/             ← 🔧 Active scanning (in progress)
-│   │   ├── ai/                  ← 🔧 AI agent layer (in progress)
-│   │   └── report/              ← PDF generator
-│   └── workers/celery_worker.py
-└── frontend/src/
+│   │   ├── recon/               # ✅ DNS, SSL, headers, fingerprint, breach
+│   │   ├── pentest/             # ✅ active_scan, tool_registry, execution_graph, nuclei, nmap, zap
+│   │   │   └── validation/      # ⬜ Phase 2: XSS/SQLi/IDOR/CORS validators
+│   │   ├── ai/                  # ✅ analyst_agent, remediation_agent, rag_engine, knowledge_base/
+│   │   │   └── llm_security/    # ⬜ Phase 3: OWASP LLM Top 10
+│   │   ├── detection/           # ⬜ Phase 4: SIEM
+│   │   └── report/              # ⬜ Phase 1.5: PDF generator
+│   └── workers/
+│       ├── scan_tasks.py        # Celery scan boundary (scan_type + scan_mode)
+│       └── analyst_tasks.py     # analyze_findings() single LLM path
+├── agents/
+│   └── orchestrator.py          # OrchestratorAgent (adaptive mode)
+├── docker/
+│   ├── docker-compose.dev.yml
+│   └── docker-compose.prod.yml  # ⬜ Phase 1.5
+└── frontend/                    # ⬜ Phase 1.5
+    └── src/
 ```
 
-## Build Status (update in PROGRESS.md, not here)
-
-- ✅ Week 1 DONE: DB, JWT auth, tier-gating, scan management, full passive recon engine
-- ✅ Week 2 DONE: constrained adaptive orchestrator, Celery pipeline wired (scan_type + scan_mode), FAISS RAG with keyword fallback, execution graph (causal DAG), KEV integration (kev_loader + kev_catalog + rag_engine enrichment), unified AnalysisReport schema, full KB expansion (Exploit-DB + NVD CVE)
-- 🔧 Week 2 REMAINING: scan metadata JSONB persistence, analyst KEV boost wiring, KEV lifespan pre-warm, @reviewer audit
-- ⬜ Week 3: React frontend, PDF reports, Alembic migrations, Docker prod image
+---
 
 ## Coding Standards
 
-- Async-first: all DB calls use `asyncpg`, all I/O uses `async/await`
-- Type hints everywhere — all functions fully typed
-- Pydantic models for all API inputs/outputs
-- Tools (Nuclei/Nmap/Gobuster) run as async subprocesses with timeouts
-- Mock mode in Windows: return structured fake JSON matching real tool output schema
+- Async-first: all DB calls and I/O use `async/await`
+- Full type hints on all functions
+- Pydantic models for all API inputs and outputs
+- Tool subprocesses: `asyncio.wait_for` with timeout (Phase 1.5 fix)
+- MOCK_MODE on Windows: returns structured fake JSON matching real tool output schema exactly
 - Never use `print()` — use Python `logging` module
-- All errors caught and returned as structured JSON, never crash the pipeline
+- All errors → structured JSON response, never crash the pipeline
+- Every new module requires `test_*.py` before marked complete
+- Adding a new tool: register in both `TOOL_REGISTRY` (catalogue/LLM prompt) AND `OPERATIONAL_REGISTRY` (callable dispatch)
 
-## Session Startup Ritual (do this every session)
+---
 
-1. Read `.claude/PROGRESS.md` to restore state
-2. Read the relevant module's `CONTEXT.md` if working on a specific module
-3. Confirm current task before writing any code
-4. On session end: update `PROGRESS.md` with what was done and what's next
+## Standing Order — Docs After Every Task
 
-## Test Before Done
-
-- Every module must have a `test_*.py` — use pytest + pytest-asyncio
-- Run tests before marking any task complete
-- Mock external APIs (OTX, Shodan, HaveIBeenPwned) in tests
-
-## Agent Delegation Rules
-
-- Use @recon-engineer for anything in modules/recon/
-- Use @pentest-engineer for anything in modules/pentest/
-- Use @ai-architect for anything in modules/ai/ and RAG design
-- Use @backend-engineer for API routes, DB models, auth, Celery
-- Use @reviewer for code review before any module is marked complete
-- Delegate when a task would generate large file reads or logs (keep main context clean)
-
-## Standing Order — Always Keep Docs Current
-
-After EVERY task, fix, or decision — without being asked — you must:
-
-1. Update .claude/PROGRESS.md
-   - Mark completed items ✅
-   - Update "Active Task"
-   - Update "Next 3 Tasks"
-   - Note any blockers discovered
-
-2. Update .claude/DECISIONS.md
-   - Log any new architectural decision made this session
-   - If an existing ADR was changed, update it with the new decision
-     and note what changed and why
-
-3. Update CLAUDE.md itself if:
-   - Build status section changes
-   - A new module is added to the directory map
-   - A core architectural rule changes
-
-4. If a module gets complex enough — create or update
-   modules/[name]/CONTEXT.md with current state of that module
-
-This is not optional. Stale docs = broken context next session =
-wasted time re-discovering what was already decided.
-
-## Mandatory Agent Delegation
-
-For EVERY task involving file reads or code changes, delegate to the
-correct specialist agent. Never read multiple large files in the main
-context window.
-
-| Task involves...        | Delegate to       |
-| ----------------------- | ----------------- |
-| api/, models/, schemas/ | @backend-engineer |
-| modules/pentest/        | @pentest-engineer |
-| modules/ai/             | @ai-architect     |
-| modules/recon/          | @recon-engineer   |
-| Any review/audit        | @reviewer         |
-
-Default behavior: if the task touches more than one file,
-delegate it. Do not read files into main context directly.
+Without being asked, after every completed task:
+1. Update `PROGRESS.md` — mark task done, update session log, note any blockers
+2. Update `DECISIONS.md` — add ADR if architectural decision was made
+3. Update this file (`CLAUDE.md`) only if phase status changes or a new directory is added

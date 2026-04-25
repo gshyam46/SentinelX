@@ -14,6 +14,12 @@ Research fields in output:
   retrieval_method  — "faiss" | "keyword" | "none"
   model_used        — LiteLLM model string
 
+Intelligence correlation fields added to every report:
+  known_exploited   — True if any finding has a KEV-matched CVE
+  exploit_available — True if any finding has an ExploitDB-matched CVE
+  priority_reason   — human-readable string for the highest-priority finding
+  attack_chains     — list of {path, impact, confidence} derived from execution_graph
+
 Boundaries (hard-coded, not LLM-configurable):
   - Cannot trigger tool execution
   - Cannot modify finding data
@@ -40,6 +46,13 @@ _MAX_OUTPUT_TOKENS = 1200
 # OWASP categories for coverage scoring
 _ALL_OWASP = {f"A{i:02d}" for i in range(1, 11)}
 
+# Strict CVE pattern used to sanitize kev_matches before prompt insertion.
+# Rejects anything with embedded newlines or extra text (prompt injection guard).
+_CVE_STRICT = re.compile(r"^CVE-\d{4}-\d+$")
+
+# Loose CVE pattern used to extract CVE IDs from arbitrary finding text.
+_CVE_PATTERN = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
+
 # KEV escalation block appended to system prompt when matches are present.
 # {cve_list} is replaced at call time with newline-joined CVE IDs.
 _KEV_SYSTEM_PROMPT_BLOCK = """\
@@ -55,6 +68,252 @@ For any finding related to these CVEs:
 - Elevate remediation priority to IMMEDIATE"""
 
 
+# ---------------------------------------------------------------------------
+# Module-level helpers (private)
+# ---------------------------------------------------------------------------
+
+def _extract_cves_from_findings(findings: List[Dict[str, Any]]) -> List[str]:
+    """
+    Extract unique CVE IDs from all string values in a findings list.
+
+    Scans each string value up to 2000 characters to prevent pathological
+    input from consuming excess CPU. Returns CVEs in encounter order,
+    uppercased, deduplicated.
+    """
+    cves: List[str] = []
+    seen: set[str] = set()
+    for finding in findings:
+        for val in finding.values():
+            if isinstance(val, str):
+                for match in _CVE_PATTERN.finditer(val[:2000]):
+                    cve = match.group(0).upper()
+                    if cve not in seen:
+                        seen.add(cve)
+                        cves.append(cve)
+    return cves
+
+
+def _enrich_with_kev(
+    findings: List[Dict[str, Any]], kev_matches: List[str]
+) -> List[Dict[str, Any]]:
+    """
+    Annotate each finding with known_exploited=True/False based on KEV matches.
+
+    Does not mutate the originals — returns new dicts.
+    """
+    kev_set = {c.upper() for c in kev_matches}
+    enriched: List[Dict[str, Any]] = []
+    for f in findings:
+        f = dict(f)
+        cves = _extract_cves_from_findings([f])
+        f["known_exploited"] = any(c in kev_set for c in cves)
+        enriched.append(f)
+    return enriched
+
+
+def _build_exploitdb_lookup(kb_sources: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Build a {CVE_ID: exploit_entry} mapping from ExploitDB KB entries.
+
+    ExploitDB entries store CVE IDs in a `codes` list as semicolon-separated
+    strings like "CVE-2021-44228;OSVDB-12345". This function parses each
+    codes entry with _CVE_PATTERN and maps every extracted CVE ID to the
+    entry. Match is on CVE field only — never on description text.
+
+    Always returns a dict; never raises.
+    """
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for entry in kb_sources:
+        codes = entry.get("codes", [])
+        if not isinstance(codes, list):
+            continue
+        for code_str in codes:
+            if not isinstance(code_str, str):
+                continue
+            for match in _CVE_PATTERN.finditer(code_str):
+                cve_upper = match.group(0).upper()
+                if cve_upper not in lookup:
+                    lookup[cve_upper] = entry
+    return lookup
+
+
+def _enrich_with_exploitdb(
+    findings: List[Dict[str, Any]], exploitdb_lookup: Dict[str, Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Annotate each finding with exploit_available=True/False based on ExploitDB lookup.
+
+    Does not mutate the originals — returns new dicts.
+    """
+    enriched: List[Dict[str, Any]] = []
+    for f in findings:
+        f = dict(f)
+        cves = _extract_cves_from_findings([f])
+        f["exploit_available"] = any(c in exploitdb_lookup for c in cves)
+        enriched.append(f)
+    return enriched
+
+
+def _apply_priority_logic(finding: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Assign a priority_reason to a finding and escalate severity when needed.
+
+    Priority rules (highest first):
+      1. CRITICAL severity + known_exploited + exploit_available
+         → "Actively exploited in the wild with public exploit available"
+      2. known_exploited (any severity)
+         → severity escalated to "CRITICAL"; "Actively exploited in the wild"
+      3. exploit_available
+         → "Public exploit available"
+      4. fallback
+         → "No known active exploitation"
+
+    Does not mutate the original — returns a new dict.
+    """
+    finding = dict(finding)
+    severity = (finding.get("severity") or "").upper()
+    known_exploited = finding.get("known_exploited", False)
+    exploit_available = finding.get("exploit_available", False)
+
+    if severity == "CRITICAL" and known_exploited and exploit_available:
+        finding["priority_reason"] = (
+            "Actively exploited in the wild with public exploit available"
+        )
+    elif known_exploited:
+        finding["severity"] = "CRITICAL"
+        finding["priority_reason"] = "Actively exploited in the wild"
+    elif exploit_available:
+        finding["priority_reason"] = "Public exploit available"
+    else:
+        finding["priority_reason"] = "No known active exploitation"
+    return finding
+
+
+def _extract_attack_chains(
+    execution_graph: Optional[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Extract attack chains from explicit DAG edges only.
+
+    Derives chains ONLY from the execution_graph node/edge structure exported
+    by execution_graph.py. Never infers chains from finding text alone.
+
+    Chain types returned:
+      - tool_execution → finding → tool_execution  (confidence: high/medium)
+      - tool_execution → finding (no follow-up tool, severity critical/high only)
+        (confidence: low)
+
+    Returns [] when execution_graph is absent, empty, or has no nodes/edges.
+    """
+    if not execution_graph:
+        return []
+
+    nodes: Dict[str, Dict[str, Any]] = {
+        n["node_id"]: n for n in execution_graph.get("nodes", [])
+    }
+    edges: List[Dict[str, Any]] = execution_graph.get("edges", [])
+
+    if not nodes or not edges:
+        return []
+
+    # Build adjacency: parent_id → list of child_ids
+    adjacency: Dict[str, List[str]] = {}
+    for edge in edges:
+        parent = edge.get("parent_id")
+        child = edge.get("child_id")
+        if parent and child:
+            adjacency.setdefault(parent, []).append(child)
+
+    chains: List[Dict[str, Any]] = []
+
+    # -- Depth-2 chains: tool → finding → tool (highest value) --
+    for node_id, node in nodes.items():
+        if node.get("node_type") != "tool_execution":
+            continue
+        children = adjacency.get(node_id, [])
+        for child_id in children:
+            child = nodes.get(child_id, {})
+            if child.get("node_type") != "finding":
+                continue
+            grandchildren = adjacency.get(child_id, [])
+            for gc_id in grandchildren:
+                gc = nodes.get(gc_id, {})
+                if gc.get("node_type") == "tool_execution":
+                    path = [
+                        node.get("tool_name", node_id),
+                        f'finding:{child.get("finding", {}).get("title", child_id)[:60]}',
+                        gc.get("tool_name", gc_id),
+                    ]
+                    sev = str(
+                        child.get("finding", {}).get("severity", "")
+                    ).upper()
+                    confidence = "high" if sev in ("CRITICAL", "HIGH") else "medium"
+                    impact = child.get("finding", {}).get("description", "")[:200]
+                    chains.append(
+                        {"path": path, "impact": impact, "confidence": confidence}
+                    )
+
+    # -- Depth-1 chains: tool → finding (no follow-up tool, critical/high only) --
+    for node_id, node in nodes.items():
+        if node.get("node_type") != "tool_execution":
+            continue
+        children = adjacency.get(node_id, [])
+        for child_id in children:
+            child = nodes.get(child_id, {})
+            if child.get("node_type") != "finding":
+                continue
+            if adjacency.get(child_id):
+                # Finding has children — already covered by the depth-2 loop above
+                continue
+            sev = str(child.get("finding", {}).get("severity", "")).upper()
+            if sev in ("CRITICAL", "HIGH"):
+                chains.append(
+                    {
+                        "path": [
+                            node.get("tool_name", node_id),
+                            f'finding:{child.get("finding", {}).get("title", child_id)[:60]}',
+                        ],
+                        "impact": child.get("finding", {}).get("description", "")[:200],
+                        "confidence": "low",
+                    }
+                )
+
+    return chains
+
+
+# ---------------------------------------------------------------------------
+# Severity ordering helper (used for priority_reason selection)
+# ---------------------------------------------------------------------------
+
+_SEV_ORDER: Dict[str, int] = {
+    "CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4
+}
+
+_PRIORITY_ORDER: Dict[str, int] = {
+    "Actively exploited in the wild with public exploit available": 0,
+    "Actively exploited in the wild": 1,
+    "Public exploit available": 2,
+    "No known active exploitation": 3,
+}
+
+
+def _pick_top_priority_reason(findings: List[Dict[str, Any]]) -> str:
+    """Return the priority_reason string from the highest-priority enriched finding."""
+    best_rank = 99
+    best_reason = "No known active exploitation"
+    for f in findings:
+        reason = f.get("priority_reason", "No known active exploitation")
+        rank = _PRIORITY_ORDER.get(reason, 3)
+        if rank < best_rank:
+            best_rank = rank
+            best_reason = reason
+    return best_reason
+
+
+# ---------------------------------------------------------------------------
+# Agent class
+# ---------------------------------------------------------------------------
+
 class AnalystAgent:
     """
     Agent 2 — LLM-powered finding interpreter.
@@ -67,10 +326,33 @@ class AnalystAgent:
     def __init__(self):
         self._rag = get_rag_engine()
 
+    # ------------------------------------------------------------------
+    # ExploitDB lookup — built once per analyze() call
+    # ------------------------------------------------------------------
+
+    def _build_exploitdb_lookup_from_rag(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Build the ExploitDB CVE→entry lookup from the RAG engine's raw KB data.
+
+        Tries self._rag._kb["exploit_db"] first (direct attribute). Catches any
+        AttributeError or KeyError and returns {} — never raises.
+        """
+        try:
+            kb: Dict[str, List[Dict[str, Any]]] = self._rag._kb  # type: ignore[attr-defined]
+            exploit_entries: List[Dict[str, Any]] = kb.get("exploit_db", [])
+            return _build_exploitdb_lookup(exploit_entries)
+        except Exception:
+            logger.debug("[Analyst] ExploitDB lookup build failed — returning empty dict")
+            return {}
+
+    # ------------------------------------------------------------------
+    # Main analysis entry point
+    # ------------------------------------------------------------------
+
     async def analyze(
         self,
         scan_results: Dict[str, Any],
-        kev_matches: List[str] = [],
+        kev_matches: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Analyze scan findings and produce a structured AnalysisReport.
@@ -84,16 +366,22 @@ class AnalystAgent:
                     "risk_level": str,
                     "total_findings": int,
                     "severity_counts": dict,
+                },
+                "scan_metadata": {          # optional
+                    "execution_graph": {...} # if present, used for attack chains
                 }
             }
             kev_matches: CVE IDs confirmed in CISA KEV catalog. When non-empty
                          the system prompt is augmented with KEV escalation
                          instructions and analyst_notes records the matches.
-                         Defaults to [] for full backward compatibility.
+                         Defaults to None (treated as empty list).
 
         Returns:
             Full AnalysisReport dict (see _empty_report for schema).
         """
+        # CRITICAL-2 fix: resolve mutable default
+        kev_matches = kev_matches or []
+
         domain = scan_results.get("domain", "Unknown")
         all_findings = scan_results.get("all_findings", [])
         summary = scan_results.get("summary", {})
@@ -116,9 +404,17 @@ class AnalystAgent:
         rag_used = bool(rag_text.strip())
         retrieval_method = self._rag.get_retrieval_method()
 
+        # GAP-1 fix: merge caller-supplied kev_matches with RAG-derived matches.
+        # This ensures KEV escalation fires even when analyst_tasks.py passes no
+        # kev_matches argument (the common production path).
+        rag_kev: List[str] = context.get("kev_matches", [])
+        effective_kev: List[str] = list(
+            dict.fromkeys((kev_matches or []) + rag_kev)  # dedup, preserve order
+        )
+
         # 2. Build prompt and (optionally) KEV-augmented system prompt
         prompt = self._build_prompt(domain, all_findings, summary, rag_text)
-        system_prompt = self._build_system_prompt(kev_matches)
+        system_prompt = self._build_system_prompt(effective_kev)
 
         # 3. LLM call
         raw = await self._call_llm(prompt, system_prompt=system_prompt)
@@ -132,12 +428,12 @@ class AnalystAgent:
         # kev_matches: CVE IDs from findings that matched the CISA KEV catalog.
         # Already computed by rag_engine.query(); surface them on the report so
         # analyst_tasks.py can persist them without re-querying the RAG engine.
-        report["kev_matches"] = context.get("kev_matches", [])
+        report["kev_matches"] = effective_kev
 
         # 6. Append KEV match record to analyst_notes (additive — never replaces)
-        if kev_matches:
+        if effective_kev:
             kev_note = (
-                f"KEV matches detected: {', '.join(kev_matches)}"
+                f"KEV matches detected: {', '.join(effective_kev)}"
                 " — severity elevated per CISA KEV catalog."
             )
             existing_notes = report.get("analyst_notes") or ""
@@ -147,10 +443,40 @@ class AnalystAgent:
             logger.info(
                 "[Analyst] KEV escalation applied for %s: %s",
                 domain,
-                ", ".join(kev_matches),
+                ", ".join(effective_kev),
             )
 
-        logger.info("[Analyst] Analysis complete for %s — risk_score=%s", domain, report.get("risk_score"))
+        # 7. Intelligence correlation (KEV + ExploitDB + priority logic)
+        exploitdb_lookup = self._build_exploitdb_lookup_from_rag()
+
+        enriched_findings = _enrich_with_kev(all_findings, effective_kev)
+        enriched_findings = _enrich_with_exploitdb(enriched_findings, exploitdb_lookup)
+        enriched_findings = [_apply_priority_logic(f) for f in enriched_findings]
+
+        report["known_exploited"] = any(
+            f.get("known_exploited", False) for f in enriched_findings
+        )
+        report["exploit_available"] = any(
+            f.get("exploit_available", False) for f in enriched_findings
+        )
+        report["priority_reason"] = _pick_top_priority_reason(enriched_findings)
+
+        # 8. Execution graph attack chain extraction
+        exec_graph = (
+            scan_results.get("scan_metadata", {}).get("execution_graph")
+            or scan_results.get("execution_graph")
+        )
+        report["attack_chains"] = _extract_attack_chains(exec_graph)
+
+        logger.info(
+            "[Analyst] Analysis complete for %s — risk_score=%s known_exploited=%s "
+            "exploit_available=%s chains=%d",
+            domain,
+            report.get("risk_score"),
+            report["known_exploited"],
+            report["exploit_available"],
+            len(report["attack_chains"]),
+        )
         return report
 
     # ------------------------------------------------------------------
@@ -200,19 +526,26 @@ Provide concrete, actionable remediation steps — not generic advice.
 Think step by step but respond only with the JSON schema."""
 
     def _build_system_prompt(self, kev_matches: List[str]) -> str:
-        """Return system prompt, with KEV escalation block appended when matches exist."""
-        if not kev_matches:
+        """
+        Return system prompt, with KEV escalation block appended when matches exist.
+
+        CRITICAL-1 fix: kev_matches are sanitized with _CVE_STRICT before insertion
+        into the prompt string, preventing prompt injection via crafted CVE IDs that
+        contain embedded newlines or extra instruction text.
+        """
+        safe_matches = [c for c in kev_matches if _CVE_STRICT.fullmatch(c)]
+        if not safe_matches:
             return self._SYSTEM_PROMPT
         kev_block = _KEV_SYSTEM_PROMPT_BLOCK.format(
-            cve_list="\n".join(kev_matches)
+            cve_list="\n".join(safe_matches)
         )
         return self._SYSTEM_PROMPT + kev_block
 
     def _build_prompt(
         self,
         domain: str,
-        findings: List[Dict],
-        summary: Dict,
+        findings: List[Dict[str, Any]],
+        summary: Dict[str, Any],
         rag_text: str,
     ) -> str:
         findings_for_prompt = self._format_findings(findings[:_MAX_FINDINGS_IN_PROMPT])
@@ -231,9 +564,11 @@ Think step by step but respond only with the JSON schema."""
         )
 
     @staticmethod
-    def _format_findings(findings: List[Dict]) -> str:
+    def _format_findings(findings: List[Dict[str, Any]]) -> str:
         sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-        sorted_f = sorted(findings, key=lambda f: sev_order.get(f.get("severity", "info"), 4))
+        sorted_f = sorted(
+            findings, key=lambda f: sev_order.get(f.get("severity", "info"), 4)
+        )
         lines = []
         for i, f in enumerate(sorted_f, 1):
             sev = f.get("severity", "info").upper()
@@ -319,8 +654,8 @@ Think step by step but respond only with the JSON schema."""
         self,
         raw: Optional[str],
         domain: str,
-        summary: Dict,
-        findings: List[Dict],
+        summary: Dict[str, Any],
+        findings: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         if not raw:
             return self._fallback_report(domain, summary, findings)
@@ -344,9 +679,12 @@ Think step by step but respond only with the JSON schema."""
             parsed["analyst_notes"] = parsed.pop("severity_reasoning")
         if "attack_chains" not in parsed and "attack_chain" in parsed:
             chain = parsed.pop("attack_chain")
-            parsed["attack_chains"] = [{"name": "Primary chain", "steps": [chain], "impact": "high"}] if chain else []
+            parsed["attack_chains"] = (
+                [{"name": "Primary chain", "steps": [chain], "impact": "high"}]
+                if chain else []
+            )
 
-        # Ensure all required fields
+        # Ensure all required fields present (including new intel correlation fields)
         defaults = self._fallback_report(domain, summary, findings)
         for key, default_val in defaults.items():
             if key not in parsed or parsed[key] is None:
@@ -359,11 +697,11 @@ Think step by step but respond only with the JSON schema."""
         return parsed
 
     # ------------------------------------------------------------------
-    # Fallback / empty reports (full schema always)
+    # Fallback / empty reports (full schema always, including intel fields)
     # ------------------------------------------------------------------
 
     def _fallback_report(
-        self, domain: str, summary: Dict, findings: List[Dict]
+        self, domain: str, summary: Dict[str, Any], findings: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         from backend.config import get_settings
         settings = get_settings()
@@ -371,7 +709,8 @@ Think step by step but respond only with the JSON schema."""
         counts: Counter = Counter(f.get("severity", "info") for f in findings)
         risk = min(
             100,
-            counts["critical"] * 25 + counts["high"] * 10 + counts["medium"] * 4 + counts["low"] * 1,
+            counts["critical"] * 25 + counts["high"] * 10
+            + counts["medium"] * 4 + counts["low"] * 1,
         )
         owasp_seen: set[str] = set()
         for f in findings:
@@ -380,8 +719,12 @@ Think step by step but respond only with the JSON schema."""
             cat: ("covered" if cat in owasp_seen else "missing")
             for cat in sorted(_ALL_OWASP)
         }
-        critical_titles = [f.get("title", "?") for f in findings if f.get("severity") == "critical"][:5]
-        high_titles = [f.get("title", "?") for f in findings if f.get("severity") == "high"][:5]
+        critical_titles = [
+            f.get("title", "?") for f in findings if f.get("severity") == "critical"
+        ][:5]
+        high_titles = [
+            f.get("title", "?") for f in findings if f.get("severity") == "high"
+        ][:5]
 
         return {
             "executive_summary": (
@@ -415,9 +758,9 @@ Think step by step but respond only with the JSON schema."""
                 }
                 for f in sorted(
                     findings,
-                    key=lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}.get(
-                        x.get("severity", "info"), 4
-                    ),
+                    key=lambda x: {
+                        "critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4
+                    }.get(x.get("severity", "info"), 4),
                 )[:3]
             ],
             "key_priorities": [
@@ -429,9 +772,13 @@ Think step by step but respond only with the JSON schema."""
             "ai_generated": False,
             "rag_context_used": False,
             "retrieval_method": self._rag.get_retrieval_method(),
-            "model_used": getattr(get_settings(), "LITELLM_MODEL", "rule_based_fallback"),
+            "model_used": getattr(settings, "LITELLM_MODEL", "rule_based_fallback"),
             # Default empty; populated by analyze() when RAG runs successfully.
             "kev_matches": [],
+            # Intelligence correlation defaults
+            "known_exploited": False,
+            "exploit_available": False,
+            "priority_reason": "No known active exploitation",
         }
 
     def _empty_report(self, domain: str) -> Dict[str, Any]:
@@ -463,10 +810,18 @@ Think step by step but respond only with the JSON schema."""
             "model_used": getattr(get_settings(), "LITELLM_MODEL", "unknown"),
             # No findings means no CVE IDs to match against KEV.
             "kev_matches": [],
+            # Intelligence correlation defaults
+            "known_exploited": False,
+            "exploit_available": False,
+            "priority_reason": "No known active exploitation",
+            "attack_chains": [],
         }
 
 
+# ---------------------------------------------------------------------------
 # Module-level singleton
+# ---------------------------------------------------------------------------
+
 _analyst_agent: Optional[AnalystAgent] = None
 
 
@@ -480,7 +835,7 @@ def get_analyst_agent() -> AnalystAgent:
 
 async def analyze_findings(
     scan_results: Dict[str, Any],
-    kev_matches: List[str] = [],
+    kev_matches: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Entry-point helper for Agent 2. Called by analyst_tasks.py.
@@ -490,6 +845,9 @@ async def analyze_findings(
         kev_matches:  CVE IDs confirmed in CISA KEV catalog (optional).
                       Passed through to AnalystAgent.analyze() for prompt
                       escalation and analyst_notes annotation.
+                      Defaults to None (treated as empty list inside analyze()).
     """
+    # CRITICAL-2 fix: resolve mutable default at module boundary too
+    kev_matches = kev_matches or []
     agent = get_analyst_agent()
     return await agent.analyze(scan_results, kev_matches=kev_matches)
