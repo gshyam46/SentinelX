@@ -1,49 +1,56 @@
-# SentinelX — Production Stack
-# Copy docker/.env.example → docker/.env and fill in secrets.
-# Run from repo root: docker compose -f docker/docker-compose.prod.yml up -d
+# SentinelX — Unified dev/test stack
+# Start everything: docker compose up --build
 
 services:
 
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
   postgres:
     image: postgres:16-alpine
-    container_name: sentinelx-db-prod
+    container_name: sentinelx-db
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sentinelx}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinelx_secret}
       POSTGRES_DB: ${POSTGRES_DB:-sentinelx}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sentinelx}"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
     restart: unless-stopped
 
   redis:
     image: redis:7-alpine
-    container_name: sentinelx-redis-prod
+    container_name: sentinelx-redis
     volumes:
       - redisdata:/data
+    ports:
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
     restart: unless-stopped
+
+  # ── Backend ─────────────────────────────────────────────────────────────────
 
   app:
     build:
-      context: ..
+      context: .
       dockerfile: docker/Dockerfile
-    container_name: sentinelx-app-prod
+    container_name: sentinelx-app
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sentinelx}
-      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sentinelx}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD:-sentinelx_secret}@postgres:5432/${POSTGRES_DB:-sentinelx}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD:-sentinelx_secret}@postgres:5432/${POSTGRES_DB:-sentinelx}
       REDIS_URL: redis://redis:6379/0
-      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-change-in-production}
       LITELLM_MODEL: ${LITELLM_MODEL:-groq/llama-3.1-70b-versatile}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -52,9 +59,9 @@ services:
       HIBP_API_KEY: ${HIBP_API_KEY:-}
       OTX_API_KEY: ${OTX_API_KEY:-}
       TOOL_TIMEOUT_SECONDS: ${TOOL_TIMEOUT_SECONDS:-120}
-      APP_ENV: production
-      MOCK_MODE: "false"
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      APP_ENV: ${APP_ENV:-development}
+      MOCK_MODE: ${MOCK_MODE:-false}
+      CORS_ORIGINS: http://localhost:5173,http://localhost:3000
       LOG_LEVEL: INFO
     depends_on:
       postgres:
@@ -63,18 +70,18 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
-      interval: 30s
+      interval: 15s
       timeout: 10s
-      retries: 3
-      start_period: 40s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   worker:
     build:
-      context: ..
+      context: .
       dockerfile: docker/Dockerfile
-    container_name: sentinelx-worker-prod
-    # Override entrypoint — worker bypasses the Alembic migration step
+    container_name: sentinelx-worker
+    # Override entrypoint — worker skips uvicorn, just runs Celery
     entrypoint: []
     command: >
       celery -A backend.workers.celery_app worker
@@ -82,10 +89,10 @@ services:
       -Q scans,analyst,default
       --concurrency=2
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sentinelx}
-      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sentinelx}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD:-sentinelx_secret}@postgres:5432/${POSTGRES_DB:-sentinelx}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD:-sentinelx_secret}@postgres:5432/${POSTGRES_DB:-sentinelx}
       REDIS_URL: redis://redis:6379/0
-      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-change-in-production}
       LITELLM_MODEL: ${LITELLM_MODEL:-groq/llama-3.1-70b-versatile}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -94,8 +101,8 @@ services:
       HIBP_API_KEY: ${HIBP_API_KEY:-}
       OTX_API_KEY: ${OTX_API_KEY:-}
       TOOL_TIMEOUT_SECONDS: ${TOOL_TIMEOUT_SECONDS:-120}
-      APP_ENV: production
-      MOCK_MODE: "false"
+      APP_ENV: ${APP_ENV:-development}
+      MOCK_MODE: ${MOCK_MODE:-false}
       LOG_LEVEL: INFO
     depends_on:
       postgres:
@@ -106,14 +113,17 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Frontend ─────────────────────────────────────────────────────────────────
+
   frontend:
     build:
-      context: ../frontend
+      context: ./frontend
       dockerfile: Dockerfile
-    container_name: sentinelx-frontend-prod
+    container_name: sentinelx-frontend
     ports:
       - "5173:5173"
     environment:
+      # Vite proxy will forward /api/* to this target inside Docker network
       BACKEND_URL: http://app:8000
     depends_on:
       app:

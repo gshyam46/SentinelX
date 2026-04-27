@@ -19,10 +19,14 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+import jwt as _jwt
+from jwt.exceptions import InvalidTokenError
+
 from fastapi import (
     APIRouter,
     Depends,
     HTTPException,
+    Query,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -323,18 +327,19 @@ async def get_scan_progress(
 async def scan_live(
     scan_id: uuid.UUID,
     websocket: WebSocket,
+    token: str = Query(...),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """
     WebSocket endpoint — subscribes to the Redis channel `scan:{scan_id}:events`
     and forwards every event message to the connected client in real-time.
 
-    Authentication: expects a JWT in the `Authorization: Bearer <token>` header
-    (handled via get_current_user dependency).
+    Authentication: JWT passed as `?token=<jwt>` query parameter.
+    Browsers cannot set Authorization headers on WebSocket connections,
+    so the standard Bearer header scheme does not work here.
 
     Client connection lifecycle:
-      1. Connect → verify scan ownership.
+      1. Connect → authenticate token → verify scan ownership.
       2. Subscribe to Redis channel.
       3. Relay messages until scan_complete / report_ready / disconnect.
       4. Send a synthetic `{"type": "stream_end"}` before closing.
@@ -342,6 +347,25 @@ async def scan_live(
     If the scan is already complete when the client connects, a summary
     snapshot is sent immediately before closing.
     """
+    # ── Authenticate via query-param token ──────────────────────────────
+    try:
+        payload = _jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        user_id_str: str | None = payload.get("sub")
+        if not user_id_str:
+            await websocket.close(code=4001)
+            return
+    except (InvalidTokenError, Exception):
+        await websocket.close(code=4001)
+        return
+
+    user_result = await db.execute(
+        select(User).where(User.id == uuid.UUID(user_id_str))
+    )
+    current_user = user_result.scalar_one_or_none()
+    if not current_user or not current_user.is_active:
+        await websocket.close(code=4001)
+        return
+
     # Verify scan ownership before accepting WebSocket
     result = await db.execute(
         select(Scan).where(

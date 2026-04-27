@@ -55,6 +55,14 @@ class ScanStatusResponse(BaseModel):
     current_step: str | None
     created_at: datetime
     completed_at: datetime | None
+    # Denormalized counters — available without reading the full results JSONB blob
+    risk_score: float = 0.0
+    findings_count: int = 0
+    critical_count: int = 0
+    high_count: int = 0
+    medium_count: int = 0
+    low_count: int = 0
+    info_count: int = 0
 
     model_config = {"from_attributes": True}
 

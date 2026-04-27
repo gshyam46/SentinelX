@@ -24,6 +24,26 @@ export interface Finding {
   discovered_at: string
 }
 
+// ─── User / Auth types ────────────────────────────────────────────────
+
+export interface UserProfile {
+  id: string
+  email: string
+  full_name: string | null
+  tier: string
+  scan_count: number
+  is_active: boolean
+  created_at: string
+}
+
+export interface TokenResponse {
+  access_token: string
+  token_type: string
+  user: UserProfile
+}
+
+// ─── Scan types ───────────────────────────────────────────────────────
+
 export interface ScanStatusResponse {
   id: string
   domain: string
@@ -33,6 +53,13 @@ export interface ScanStatusResponse {
   current_step?: string
   created_at: string
   completed_at?: string
+  risk_score: number
+  findings_count: number
+  critical_count: number
+  high_count: number
+  medium_count: number
+  low_count: number
+  info_count: number
 }
 
 export interface ExecutionGraphNode {
@@ -190,19 +217,16 @@ http.interceptors.request.use((config) => {
 
 export const api = {
   // Auth
-  async login(email: string, password: string) {
-    const form = new URLSearchParams({ username: email, password })
-    const res = await http.post<{ access_token: string; token_type: string }>(
-      '/auth/login',
-      form.toString(),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    )
+  async login(email: string, password: string): Promise<TokenResponse> {
+    const res = await http.post<TokenResponse>('/auth/login', { email, password })
     localStorage.setItem('sentinel_token', res.data.access_token)
+    localStorage.setItem('sentinel_user', JSON.stringify(res.data.user))
     return res.data
   },
 
   logout() {
     localStorage.removeItem('sentinel_token')
+    localStorage.removeItem('sentinel_user')
   },
 
   // Scans
@@ -275,9 +299,10 @@ export function useScanLive(
     const token = localStorage.getItem('sentinel_token') ?? ''
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
     const host = window.location.host
-    const url = `${protocol}://${host}/api/v1/scans/${scanId}/live`
+    // Token passed as query param — browsers cannot send Authorization headers on WS
+    const url = `${protocol}://${host}/api/v1/scans/${scanId}/live?token=${encodeURIComponent(token)}`
 
-    const ws = new WebSocket(url, token ? [`bearer.${token}`] : undefined)
+    const ws = new WebSocket(url)
     wsRef.current = ws
 
     ws.onopen = () => {
