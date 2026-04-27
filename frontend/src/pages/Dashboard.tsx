@@ -6,46 +6,47 @@ import {
   TrendingUp, Target, BarChart3,
 } from 'lucide-react'
 import { api, type ScanStatusResponse, type ScanType } from '@/lib/api'
+import { useAuth } from '@/lib/auth'
 import { riskColor, formatRelativeTime } from '@/lib/utils'
-
-// ── Mock stats for demo when API not connected ────────────────────────
-const DEMO_STATS = { totalScans: 147, criticalFindings: 23, assetsProtected: 12 }
-const DEMO_SCANS: ScanStatusResponse[] = [
-  { id: 'a1b2', domain: 'api.corp.internal',     scan_type: 'active',  status: 'complete', progress: 100, created_at: new Date(Date.now() - 7_200_000).toISOString() },
-  { id: 'c3d4', domain: 'staging.saas.io',       scan_type: 'passive', status: 'running',  progress: 62,  created_at: new Date(Date.now() -   900_000).toISOString() },
-  { id: 'e5f6', domain: 'checkout.payments.com', scan_type: 'full',    status: 'complete', progress: 100, created_at: new Date(Date.now() - 86_400_000).toISOString() },
-  { id: 'g7h8', domain: 'dev.example.com',       scan_type: 'passive', status: 'failed',   progress: 0,   created_at: new Date(Date.now() - 172_800_000).toISOString() },
-]
-const DEMO_RISK: Record<string, number> = { a1b2: 82, c3d4: 47, e5f6: 31, g7h8: 0 }
 
 export default function Dashboard() {
   const navigate = useNavigate()
+  const { isPro } = useAuth()
   const [domain, setDomain] = useState('')
   const [scanType, setScanType] = useState<ScanType>('passive')
+  const [scanMode, setScanMode] = useState<'deterministic' | 'adaptive'>('deterministic')
   const [authConfirmed, setAuthConfirmed] = useState(false)
   const [isLaunching, setIsLaunching] = useState(false)
-  const [scans, setScans] = useState<ScanStatusResponse[]>(DEMO_SCANS)
+  const [scans, setScans] = useState<ScanStatusResponse[]>([])
+  const [scansLoading, setScansLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  // Focus input on mount
   useEffect(() => { inputRef.current?.focus() }, [])
 
-  // Poll recent scans
   useEffect(() => {
     let alive = true
     const fetchScans = async () => {
       try {
-        const data = await api.listScans(0, 10)
-        if (alive) setScans(data.scans)
+        const data = await api.listScans(0, 20)
+        if (alive) {
+          setScans(data.scans)
+          setScansLoading(false)
+        }
       } catch {
-        // Use demo data if API not available
+        if (alive) setScansLoading(false)
       }
     }
     fetchScans()
     const id = setInterval(fetchScans, 10_000)
     return () => { alive = false; clearInterval(id) }
   }, [])
+
+  // ── Stats derived from real scan data ──────────────────────────────────
+  const totalScans = scans.length
+  const criticalFindings = scans.reduce((acc, s) => acc + (s.critical_count ?? 0), 0)
+  const activeScans = scans.filter(s => s.status === 'running').length
+  const completedScans = scans.filter(s => s.status === 'complete').length
 
   async function handleLaunch() {
     if (!domain.trim()) {
@@ -64,6 +65,7 @@ export default function Dashboard() {
       const scan = await api.createScan({
         domain: domain.trim(),
         scan_type: scanType,
+        scan_mode: scanType !== 'passive' ? scanMode : undefined,
         authorization_confirmed: authConfirmed,
       })
       navigate(`/scans/${scan.id}`)
@@ -78,8 +80,6 @@ export default function Dashboard() {
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === 'Enter') handleLaunch()
   }
-
-  const isPro = false // replace with actual user tier from auth context
 
   return (
     <div className="px-8 py-8 max-w-7xl">
@@ -98,24 +98,24 @@ export default function Dashboard() {
         {[
           {
             label: 'Total Scans',
-            value: DEMO_STATS.totalScans,
+            value: totalScans,
             icon: BarChart3,
             color: '#3B82F6',
-            sub: '+8 this week',
+            sub: activeScans > 0 ? `${activeScans} running` : `${completedScans} complete`,
           },
           {
             label: 'Critical Findings',
-            value: DEMO_STATS.criticalFindings,
+            value: criticalFindings,
             icon: AlertTriangle,
             color: '#EF4444',
-            sub: '3 unresolved',
+            sub: criticalFindings > 0 ? 'Requires attention' : 'None detected',
           },
           {
-            label: 'Assets Monitored',
-            value: DEMO_STATS.assetsProtected,
+            label: 'Scans Complete',
+            value: completedScans,
             icon: ShieldCheck,
             color: '#22C55E',
-            sub: 'All scanned',
+            sub: totalScans > 0 ? `${Math.round((completedScans / totalScans) * 100)}% success rate` : 'No scans yet',
           },
         ].map(({ label, value, icon: Icon, color, sub }) => (
           <div
@@ -145,7 +145,6 @@ export default function Dashboard() {
         className="glass mb-8 relative overflow-hidden"
         style={{ padding: '32px 36px' }}
       >
-        {/* Background decoration */}
         <div
           className="absolute top-0 right-0 pointer-events-none"
           style={{
@@ -216,6 +215,33 @@ export default function Dashboard() {
             })}
           </div>
 
+          {/* Scan mode select — shown for active/full only */}
+          {scanType !== 'passive' && (
+            <div className="flex items-center gap-3 mb-4">
+              <span className="text-xs font-semibold" style={{ color: '#6B7280', minWidth: 80 }}>
+                Scan Mode
+              </span>
+              {(['deterministic', 'adaptive'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setScanMode(mode)}
+                  className="px-3 py-1.5 rounded text-xs font-semibold capitalize transition-all"
+                  style={{
+                    background: scanMode === mode ? 'rgba(139,92,246,0.12)' : 'rgba(17,24,39,0.6)',
+                    border: scanMode === mode ? '1px solid rgba(139,92,246,0.4)' : '1px solid #1F2937',
+                    color: scanMode === mode ? '#A78BFA' : '#6B7280',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {mode}
+                </button>
+              ))}
+              <span className="text-xs" style={{ color: '#4B5563' }}>
+                {scanMode === 'adaptive' ? 'LLM selects tools dynamically' : 'Fixed tool sequence, no LLM'}
+              </span>
+            </div>
+          )}
+
           {/* Domain input row */}
           <div className="flex gap-3 items-start">
             <div className="flex-1 relative">
@@ -274,7 +300,6 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* Error */}
           {error && (
             <div
               className="mt-3 flex items-center gap-2 px-3 py-2 rounded-lg text-sm"
@@ -317,7 +342,14 @@ export default function Dashboard() {
               </tr>
             </thead>
             <tbody>
-              {scans.length === 0 && (
+              {scansLoading && (
+                <tr>
+                  <td colSpan={7} className="text-center py-8" style={{ color: '#4B5563' }}>
+                    Loading scans…
+                  </td>
+                </tr>
+              )}
+              {!scansLoading && scans.length === 0 && (
                 <tr>
                   <td colSpan={7} className="text-center py-12" style={{ color: '#4B5563' }}>
                     No scans yet — launch your first scan above
@@ -325,8 +357,8 @@ export default function Dashboard() {
                 </tr>
               )}
               {scans.map((scan) => {
-                const risk = DEMO_RISK[scan.id] ?? 0
-                const riskCol = risk ? riskColor(risk) : '#4B5563'
+                const risk = scan.risk_score ?? 0
+                const riskCol = risk > 0 ? riskColor(risk) : '#4B5563'
                 return (
                   <tr key={scan.id} onClick={() => navigate(`/scans/${scan.id}`)}>
                     <td>
@@ -359,9 +391,9 @@ export default function Dashboard() {
                     <td>
                       {risk > 0 ? (
                         <div className="flex items-center gap-2">
-                          <span className="font-mono font-bold text-sm" style={{ color: riskCol }}>{risk}</span>
+                          <span className="font-mono font-bold text-sm" style={{ color: riskCol }}>{Math.round(risk)}</span>
                           <div className="progress-bar" style={{ width: 60 }}>
-                            <div className="progress-fill" style={{ width: `${risk}%`, background: riskCol }} />
+                            <div className="progress-fill" style={{ width: `${Math.min(100, risk)}%`, background: riskCol }} />
                           </div>
                         </div>
                       ) : (

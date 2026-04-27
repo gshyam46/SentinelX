@@ -21,17 +21,6 @@ from typing import AsyncGenerator, Literal, Optional
 logger = logging.getLogger("sentinelx.orchestrator")
 
 # ---------------------------------------------------------------------------
-# Tool budget per tier
-# ---------------------------------------------------------------------------
-TIER_BUDGETS: dict[str, int] = {"free": 8, "pro": 30}
-
-# Tools gated to paid tier only
-PRO_ONLY_TOOLS = {"sqlmap_scan", "dalfox_scan", "feroxbuster"}
-
-# All 10 OWASP 2021 category IDs
-ALL_OWASP = {f"A{i:02d}" for i in range(1, 11)}
-
-# ---------------------------------------------------------------------------
 # Tool registry — every tool the orchestrator can invoke
 # ---------------------------------------------------------------------------
 TOOL_REGISTRY: dict[str, dict] = {
@@ -84,6 +73,18 @@ TOOL_REGISTRY: dict[str, dict] = {
         "description": "TCP port enumeration and service/version detection",
         "owasp": ["A05"],
         "timeout": 600,
+    },
+    "zap": {
+        "category": "active",
+        "description": "OWASP ZAP web application scanner — passive spider + active attack templates",
+        "owasp": ["A01", "A02", "A03", "A05", "A07"],
+        "timeout": 900,
+    },
+    "gobuster": {
+        "category": "active",
+        "description": "Directory and file brute-forcing via wordlist (optional, high noise)",
+        "owasp": ["A01", "A05"],
+        "timeout": 300,
     },
     "nikto": {
         "category": "active",
@@ -184,8 +185,9 @@ class Finding:
 @dataclass
 class ScanState:
     target: str
-    tier: Literal["free", "pro"]
     scan_id: uuid.UUID
+    budget: int
+    allowed_tools: list[str]
     findings: list[Finding] = field(default_factory=list)
     tools_run: list[str] = field(default_factory=list)
     tool_budget: int = field(init=False)
@@ -194,7 +196,7 @@ class ScanState:
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:
-        self.tool_budget = TIER_BUDGETS.get(self.tier, TIER_BUDGETS["free"])
+        self.tool_budget = self.budget
 
     # ── Exit condition checks (evaluated at the top of every iteration) ──────
 
@@ -205,17 +207,11 @@ class ScanState:
         """Three consecutive tool runs that produced zero new findings."""
         return self.consecutive_empty_runs >= 3
 
-    def full_owasp_coverage(self) -> bool:
-        """All 10 OWASP categories flagged — pro tier early-exit only."""
-        return self.tier == "pro" and ALL_OWASP.issubset(self.coverage_flags)
-
     def should_exit(self) -> tuple[bool, str]:
         if self.budget_exhausted():
-            return True, f"Tool budget exhausted ({TIER_BUDGETS[self.tier]} calls)"
+            return True, f"Tool budget exhausted ({self.budget} calls)"
         if self.stalled():
             return True, "3 consecutive empty tool runs — target sufficiently covered"
-        if self.full_owasp_coverage():
-            return True, "Full OWASP Top 10 coverage achieved"
         return False, ""
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -227,15 +223,11 @@ class ScanState:
         return counts
 
     def available_tools(self) -> list[str]:
-        """Tools not yet run and accessible by this tier."""
-        out = []
-        for name, meta in TOOL_REGISTRY.items():
-            if name in self.tools_run:
-                continue
-            if meta.get("pro_only") and self.tier == "free":
-                continue
-            out.append(name)
-        return out
+        """Tools not yet run and within the caller-enforced allowed list."""
+        return [
+            name for name in self.allowed_tools
+            if name not in self.tools_run and name in TOOL_REGISTRY
+        ]
 
     def record_tool_result(self, tool: str, new_findings: list[Finding]) -> None:
         self.tools_run.append(tool)
@@ -294,7 +286,7 @@ ADAPTIVE SELECTION RULES (apply these in order):
 5. If any tool found an HTTP 200 on /.git/ -> next tool: gitleaks (IMMEDIATE, highest priority)
 6. If nuclei already confirmed SQLi -> DO NOT run sqlmap_scan (already confirmed, save budget)
 7. Never run the same tool twice on the same target
-8. Free tier: never select sqlmap_scan, dalfox_scan, or feroxbuster
+8. Only select tools from the AVAILABLE TOOLS list shown below — selecting any other tool name is invalid
 
 RESPONSE FORMAT — respond with valid JSON only, no prose:
 {
@@ -334,7 +326,6 @@ async def _llm_decide(state: ScanState) -> dict:
     ) or "  None yet."
 
     user_msg = f"""TARGET: {state.target}
-TIER: {state.tier}
 BUDGET REMAINING: {state.tool_budget} tool calls
 TOOLS ALREADY RUN: {', '.join(state.tools_run) or 'None'}
 OWASP COVERAGE SO FAR: {', '.join(sorted(state.coverage_flags)) or 'None'}
@@ -390,7 +381,7 @@ def _parse_llm_json(raw: str, state: ScanState) -> dict:
     action = decision.get("action")
     tool = decision.get("tool")
 
-    # Guard against hallucinated or invalid tool names
+    # Guard: validate tool against the code-enforced allowed list
     if action == "run_tool":
         if tool not in TOOL_REGISTRY:
             logger.warning(f"LLM selected unknown tool '{tool}' — falling back")
@@ -398,9 +389,13 @@ def _parse_llm_json(raw: str, state: ScanState) -> dict:
         if tool in state.tools_run:
             logger.warning(f"LLM tried to re-run '{tool}' — falling back")
             return _rule_based_decision(state)
-        if TOOL_REGISTRY[tool].get("pro_only") and state.tier == "free":
-            logger.warning(f"LLM selected pro-only tool '{tool}' for free tier — falling back")
+        if tool not in state.allowed_tools:
+            logger.warning(f"LLM selected disallowed tool '{tool}' — falling back")
             return _rule_based_decision(state)
+        logger.info(
+            "[%s] LLM→tool_selected: %s | reasoning: %s",
+            state.scan_id, tool, decision.get("reasoning", "")[:120],
+        )
 
     return decision
 
@@ -510,16 +505,23 @@ async def _execute_tool(
     state: ScanState,
 ) -> list[Finding]:
     """
-    Dispatch a tool call to its implementation module.
+    Dispatch a tool call through the operational registry.
     Returns a list of new Finding objects.
 
-    Real implementations live in backend/tools/<tool_name>.py.
-    Each module must expose: async def run(params) -> list[Finding]
+    All tool implementations live in backend/modules/pentest/ and are
+    registered in backend/modules/pentest/tool_registry.OPERATIONAL_REGISTRY.
     """
     try:
-        import importlib
-        mod = importlib.import_module(f"backend.tools.{tool}")
-        raw_findings = await mod.run(params)
+        from backend.modules.pentest.tool_registry import OPERATIONAL_REGISTRY
+
+        executor = OPERATIONAL_REGISTRY.get(tool)
+        if executor is None:
+            logger.warning(f"Tool '{tool}' has no operational implementation — skipping")
+            return []
+
+        target = params.get("target", state.target)
+        raw_findings = await executor(target=target, scan_id=state.scan_id, params=params)
+
         findings = []
         for r in raw_findings:
             if isinstance(r, Finding):
@@ -529,7 +531,7 @@ async def _execute_tool(
                     title=r.get("title", "Unknown"),
                     severity=r.get("severity", "info"),
                     description=r.get("description", ""),
-                    target=r.get("target", params.get("target", state.target)),
+                    target=r.get("target", target),
                     source_tool=tool,
                     owasp_categories=r.get("owasp_categories", []),
                     cve_id=r.get("cve_id"),
@@ -537,9 +539,7 @@ async def _execute_tool(
                     raw=r,
                 ))
         return findings
-    except ModuleNotFoundError:
-        logger.warning(f"Tool module backend/tools/{tool}.py not found — returning empty")
-        return []
+
     except Exception as exc:
         logger.error(f"Tool '{tool}' raised an exception: {exc}", exc_info=True)
         return []
@@ -572,8 +572,8 @@ class OrchestratorAgent:
         Final event is always type="scan_complete".
         """
         logger.info(
-            f"[{state.scan_id}] Orchestrator starting — "
-            f"target={state.target} tier={state.tier} budget={state.tool_budget}"
+            "[%s] Orchestrator starting — target=%s budget=%d tools_allowed=%d",
+            state.scan_id, state.target, state.tool_budget, len(state.allowed_tools),
         )
 
         # ── Main loop — not while True ──────────────────────────────────────
@@ -708,7 +708,7 @@ class OrchestratorAgent:
                 "total_findings": len(state.findings),
                 "severity_summary": severity_summary,
                 "owasp_coverage": sorted(state.coverage_flags),
-                "budget_used": TIER_BUDGETS[state.tier] - state.tool_budget,
+                "budget_used": state.budget - state.tool_budget,
                 "scan_duration_seconds": (
                     datetime.now(timezone.utc) - state.started_at
                 ).total_seconds(),
@@ -730,25 +730,26 @@ class OrchestratorAgent:
 
 async def run_orchestrator(
     target: str,
-    tier: Literal["free", "pro"],
     scan_id: uuid.UUID,
+    budget: int,
+    allowed_tools: list[str],
     initial_findings: Optional[list[Finding]] = None,
 ) -> AsyncGenerator[ScanEvent, None]:
     """
-    Entry point. Creates ScanState and starts the orchestrator loop.
+    Entry point. Creates ScanState and starts the constrained adaptive loop.
 
-    Usage (in Celery worker or FastAPI background task):
+    The caller (Celery worker) is responsible for computing budget and
+    allowed_tools from the user's tier. The orchestrator is tier-agnostic.
 
-        async for event in run_orchestrator(target, tier, scan_id):
-            if event.type == "scan_complete":
-                # hand off to Analyst agent
-                await trigger_analyst_chain(scan_id, state)
-            await update_db_progress(scan_id, event)
+    Usage:
+        async for event in run_orchestrator(target, scan_id, budget, allowed_tools):
+            ...
     """
     state = ScanState(
         target=target,
-        tier=tier,
         scan_id=scan_id,
+        budget=budget,
+        allowed_tools=allowed_tools,
         findings=list(initial_findings or []),
     )
     agent = OrchestratorAgent()

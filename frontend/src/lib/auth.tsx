@@ -4,15 +4,16 @@
  */
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import axios from 'axios'
-import { api } from './api'
+import { api, type TokenResponse } from './api'
 
 interface User {
   id: string
   email: string
-  full_name: string
-  tier: 'free' | 'pro' | 'enterprise'
+  full_name: string | null
+  tier: string
   scan_count: number
   is_active: boolean
+  created_at?: string
 }
 
 interface AuthCtx {
@@ -37,25 +38,46 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const fetchMe = useCallback(async () => {
     const token = localStorage.getItem('sentinel_token')
-    if (!token) { setIsLoading(false); return }
+    if (!token) {
+      setIsLoading(false)
+      return
+    }
+
+    // Fast path: restore cached user object while /me is in-flight
+    const cached = localStorage.getItem('sentinel_user')
+    if (cached) {
+      try {
+        setUser(JSON.parse(cached))
+      } catch {
+        localStorage.removeItem('sentinel_user')
+      }
+    }
+
     try {
       const res = await axios.get<User>('/api/v1/auth/me', {
         headers: { Authorization: `Bearer ${token}` },
       })
       setUser(res.data)
+      localStorage.setItem('sentinel_user', JSON.stringify(res.data))
     } catch {
+      // Token invalid/expired — clear everything
       localStorage.removeItem('sentinel_token')
+      localStorage.removeItem('sentinel_user')
       setUser(null)
     } finally {
       setIsLoading(false)
     }
   }, [])
 
-  useEffect(() => { fetchMe() }, [fetchMe])
+  useEffect(() => {
+    fetchMe()
+  }, [fetchMe])
 
   const login = async (email: string, password: string) => {
-    await api.login(email, password)
-    await fetchMe()
+    // api.login stores token + user in localStorage
+    const data: TokenResponse = await api.login(email, password)
+    setUser(data.user)
+    setIsLoading(false)
   }
 
   const logout = () => {
@@ -63,7 +85,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(null)
   }
 
-  const isPro = user?.tier === 'pro' || user?.tier === 'enterprise'
+  // 'paid' is the DB value for pro-tier users; 'pro' and 'enterprise' are also pro
+  const isPro = user?.tier === 'pro' || user?.tier === 'paid' || user?.tier === 'enterprise'
 
   return (
     <AuthContext.Provider value={{ user, isPro, isLoading, login, logout }}>

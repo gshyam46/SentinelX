@@ -1,0 +1,125 @@
+# SentinelX — Production Stack
+# Copy docker/.env.example → docker/.env and fill in secrets.
+# Run from repo root: docker compose -f docker/docker-compose.prod.yml up -d
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinelx-db-prod
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sentinelx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-sentinelx}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sentinelx}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: sentinelx-redis-prod
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: sentinelx-app-prod
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sentinelx}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sentinelx}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      LITELLM_MODEL: ${LITELLM_MODEL:-groq/llama-3.1-70b-versatile}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      HIBP_API_KEY: ${HIBP_API_KEY:-}
+      OTX_API_KEY: ${OTX_API_KEY:-}
+      TOOL_TIMEOUT_SECONDS: ${TOOL_TIMEOUT_SECONDS:-120}
+      APP_ENV: production
+      MOCK_MODE: "false"
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: sentinelx-worker-prod
+    # Override entrypoint — worker bypasses the Alembic migration step
+    entrypoint: []
+    command: >
+      celery -A backend.workers.celery_app worker
+      --loglevel=info
+      -Q scans,analyst,default
+      --concurrency=2
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sentinelx}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-sentinelx}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sentinelx}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      LITELLM_MODEL: ${LITELLM_MODEL:-groq/llama-3.1-70b-versatile}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      HIBP_API_KEY: ${HIBP_API_KEY:-}
+      OTX_API_KEY: ${OTX_API_KEY:-}
+      TOOL_TIMEOUT_SECONDS: ${TOOL_TIMEOUT_SECONDS:-120}
+      APP_ENV: production
+      MOCK_MODE: "false"
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: sentinelx-frontend-prod
+    ports:
+      - "5173:5173"
+    environment:
+      BACKEND_URL: http://app:8000
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

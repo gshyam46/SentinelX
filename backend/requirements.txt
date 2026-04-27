@@ -14,7 +14,7 @@ python-dotenv>=1.0.0
 
 # ===== Auth =====
 passlib[bcrypt]>=1.7.4
-python-jose[cryptography]>=3.3.0
+PyJWT>=2.8.0
 
 # ===== HTTP / Networking =====
 httpx>=0.28.0
@@ -35,9 +35,12 @@ websockets>=13.0       # required by FastAPI WebSocket endpoints
 # ===== AI / LLM =====
 litellm>=1.50.0
 
-# ===== RAG (Phase 2 — uncomment when upgrading from keyword to vector search) =====
-# faiss-cpu>=1.9.0
-# sentence-transformers>=3.3.0
+# ===== RAG — FAISS vector search (soft dependency — keyword fallback if unavailable) =====
+# Linux/Mac: pip install faiss-cpu sentence-transformers numpy
+# Windows: use conda or WSL — pip install may fail without MSVC build tools
+faiss-cpu>=1.9.0
+sentence-transformers>=3.3.0
+numpy>=1.26.0
 
 # ===== Report Generation =====
 reportlab>=4.2.0

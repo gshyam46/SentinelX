@@ -5,13 +5,15 @@ Pydantic models for scan request/response validation.
 
 import uuid
 from datetime import datetime
-from pydantic import BaseModel, Field, field_validator
+from typing import Optional
+from pydantic import BaseModel, Field, field_validator, model_validator
 import re
 
 
 class ScanRequest(BaseModel):
     domain: str = Field(..., min_length=3, max_length=255)
     scan_type: str = Field(default="passive", pattern="^(passive|active|full)$")
+    scan_mode: str = Field(default="adaptive", pattern="^(deterministic|adaptive)$")
     authorization_confirmed: bool = False
 
     @field_validator("domain")
@@ -53,6 +55,14 @@ class ScanStatusResponse(BaseModel):
     current_step: str | None
     created_at: datetime
     completed_at: datetime | None
+    # Denormalized counters — available without reading the full results JSONB blob
+    risk_score: float = 0.0
+    findings_count: int = 0
+    critical_count: int = 0
+    high_count: int = 0
+    medium_count: int = 0
+    low_count: int = 0
+    info_count: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -75,8 +85,49 @@ class ScanResultResponse(BaseModel):
     error_message: str | None
     created_at: datetime
     completed_at: datetime | None
+    # Additive metadata fields — default to safe values so old DB records
+    # that pre-date these fields still deserialize without error.
+    execution_graph_present: bool = False
+    kev_matches: list[str] = Field(default_factory=list)
+    execution_graph: Optional[dict] = None
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _extract_from_results(self) -> "ScanResultResponse":
+        """
+        Populate derived fields from scan.results (a JSONB dict stored on the ORM
+        object).  These fields are NOT ORM columns — they live inside the JSON blob
+        and must be pulled out manually after Pydantic has hydrated the flat ORM
+        attributes.
+
+        Runs only when the fields still carry their defaults, so an explicit caller
+        that already provides values (e.g. tests) is never overwritten.
+        """
+        results_dict: dict | None = self.results  # hydrated from ORM .results column
+        if not results_dict:
+            return self
+
+        scan_metadata = results_dict.get("scan_metadata") or {}
+
+        if not self.execution_graph_present:
+            # Prefer the flag stored in scan_metadata; fall back to inferring from
+            # the full graph payload stored at the top-level results key.
+            stored_flag = scan_metadata.get("execution_graph_present")
+            if stored_flag is not None:
+                self.execution_graph_present = bool(stored_flag)
+            elif results_dict.get("execution_graph") is not None:
+                self.execution_graph_present = True
+
+        if not self.kev_matches:
+            stored_kev = scan_metadata.get("kev_matches")
+            if stored_kev:
+                self.kev_matches = list(stored_kev)
+
+        if self.execution_graph is None:
+            self.execution_graph = results_dict.get("execution_graph")
+
+        return self
 
 
 class ScanListResponse(BaseModel):

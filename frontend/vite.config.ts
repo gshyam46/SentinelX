@@ -3,6 +3,8 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 
+const backendTarget = process.env.BACKEND_URL ?? 'http://localhost:8000'
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
@@ -11,15 +13,13 @@ export default defineConfig({
     },
   },
   server: {
+    host: '0.0.0.0',
+    port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: backendTarget,
         changeOrigin: true,
-      },
-      '/ws': {
-        target: 'ws://localhost:8000',
-        ws: true,
-        changeOrigin: true,
+        ws: true,  // required — WS connections to /api/v1/scans/*/live go through here
       },
     },
   },
