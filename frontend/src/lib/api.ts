@@ -24,6 +24,37 @@ export interface Finding {
   discovered_at: string
   validated?: 'confirmed' | 'false_positive' | 'pending' | null
   known_exploited?: boolean
+  confidence?: number
+  fix_status?: 'fixed' | 'still_present' | null
+}
+
+export interface AuthConfig {
+  type: 'cookie' | 'bearer' | 'basic'
+  cookie?: string
+  token?: string
+  username?: string
+  password?: string
+  login_url?: string
+}
+
+// ─── LLM Security types ───────────────────────────────────────────────
+
+export interface LLMCheck {
+  check_id: string
+  title: string
+  detected: boolean
+  confidence: number
+  evidence: string[]
+  description?: string
+}
+
+export interface LLMSecurityReport {
+  scan_id: string
+  generated_at: string
+  risk_score: number
+  checks: LLMCheck[]
+  attack_chains: AttackChain[]
+  summary?: string
 }
 
 // ─── User / Auth types ────────────────────────────────────────────────
@@ -160,6 +191,7 @@ export interface ScanCreateRequest {
   scan_type: ScanType
   scan_mode?: 'deterministic' | 'adaptive'
   authorization_confirmed: boolean
+  auth_config?: AuthConfig
 }
 
 // ─── Live event types (Redis pub/sub via WebSocket) ───────────────────
@@ -204,7 +236,7 @@ export interface LiveEvent {
 // ─── Axios instance ───────────────────────────────────────────────────
 
 const http = axios.create({
-  baseURL: '/api/v1',
+  baseURL: import.meta.env.VITE_API_URL ?? '/api/v1',
   timeout: 30_000,
   headers: { 'Content-Type': 'application/json' },
 })
@@ -261,6 +293,22 @@ export const api = {
   async downloadScanPdf(id: string): Promise<Blob> {
     const res = await http.get(`/scans/${id}/pdf-report`, { responseType: 'blob' })
     return res.data as Blob
+  },
+
+  async register(email: string, password: string, fullName?: string): Promise<TokenResponse> {
+    const res = await http.post<TokenResponse>('/auth/register', {
+      email,
+      password,
+      full_name: fullName ?? null,
+    })
+    localStorage.setItem('sentinel_token', res.data.access_token)
+    localStorage.setItem('sentinel_user', JSON.stringify(res.data.user))
+    return res.data
+  },
+
+  async getLLMSecurityReport(scanId: string): Promise<LLMSecurityReport> {
+    const res = await http.get<LLMSecurityReport>(`/scans/${scanId}/llm-security-report`)
+    return res.data
   },
 
   // Health

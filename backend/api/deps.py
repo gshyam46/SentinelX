@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 from jwt.exceptions import InvalidTokenError
@@ -87,9 +87,18 @@ async def get_current_user(
 
 
 async def require_paid_tier(
+    request: Request,
     current_user: User = Depends(get_current_user),
 ) -> User:
     """Require the user to have a paid tier subscription."""
+    # Dev bypass — gated by env flag + secret header; never active in prod
+    if (
+        settings.DEV_BYPASS_TIER
+        and settings.DEV_BYPASS_SECRET
+        and request.headers.get("X-Dev-Bypass") == settings.DEV_BYPASS_SECRET
+    ):
+        return current_user
+
     if current_user.tier not in ("paid", "enterprise"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # --- Dev / Mock ---
     MOCK_MODE: bool = False  # Set True on Windows — tool wrappers return structured fake JSON
 
+    # --- Dev tier bypass (never set in prod) ---
+    DEV_BYPASS_TIER: bool = False
+    DEV_BYPASS_SECRET: str = ""
+
     # --- Rate Limits ---
     MAX_FREE_SCANS_PER_DAY: int = 3
 

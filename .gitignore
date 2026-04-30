@@ -23,7 +23,7 @@ venv/
 env/
 # Env files
 .env
-.env.*
+*.env.*
 *.env
 
 # Claude AI files
