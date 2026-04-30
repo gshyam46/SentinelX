@@ -22,9 +22,9 @@ AI-driven security decision engine: external black-box pentesting + LLM security
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Backend core, passive recon, active scan, AI analyst, execution graph, KEV/RAG | ✅ COMPLETE |
-| 1.5 | Docker prod, Alembic, W2/W5/W6 fixes, React UI, PDF report, Linux E2E validation | 🔧 ACTIVE |
-| 2 | Validation layer, PTT, chained attack paths, Find→Fix→Verify, authenticated scan | ⬜ QUEUED |
-| 3 | LLM security module (OWASP LLM Top 10) | ⬜ QUEUED |
+| 1.5 | Docker prod, Alembic, W2/W5/W6 fixes, React UI, PDF report, Linux E2E validation | ✅ COMPLETE |
+| 2 | Validation layer, PTT, chained attack paths, Find→Fix→Verify, authenticated scan | ✅ COMPLETE |
+| 3 | LLM security module (OWASP LLM Top 10) | 🔧 ACTIVE |
 | 4 | SIEM module | ⬜ QUEUED |
 | 5 | VAPT+SOC with code access | ⬜ QUEUED |
 

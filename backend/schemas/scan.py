@@ -5,9 +5,23 @@ Pydantic models for scan request/response validation.
 
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 import re
+
+
+class AuthConfig(BaseModel):
+    """Scan-level authentication credentials. Stored encrypted in scan.results — never returned via API."""
+
+    type: Literal["cookie", "bearer", "basic"]
+    cookie: Optional[str] = None    # raw Cookie header string (cookie auth)
+    token: Optional[str] = None     # bearer token value (bearer auth)
+    username: Optional[str] = None  # HTTP Basic username
+    password: Optional[str] = None  # HTTP Basic password
+    login_url: Optional[str] = None # optional login endpoint for session-based auth
+
+    # Phase 3 hardening note: cookie / token / password require field-level encryption
+    # (Fernet or AES-256-GCM) before the JSONB column is written to disk.
 
 
 class ScanRequest(BaseModel):
@@ -15,6 +29,7 @@ class ScanRequest(BaseModel):
     scan_type: str = Field(default="passive", pattern="^(passive|active|full)$")
     scan_mode: str = Field(default="adaptive", pattern="^(deterministic|adaptive)$")
     authorization_confirmed: bool = False
+    auth_config: Optional[AuthConfig] = None
 
     @field_validator("domain")
     @classmethod
@@ -44,6 +59,14 @@ class FindingSchema(BaseModel):
     cvss_score: float | None = None
     cve_id: str | None = None
     mitre_id: str | None = None
+    # Phase 2 P2-01: validation layer — None means not yet validated (old findings safe to deserialize)
+    validated: Optional[bool] = None
+    confidence: Optional[float] = None
+    validation_method: Optional[str] = None
+    # Phase 2 P2-03: Find→Fix→Verify — None until verification is explicitly triggered
+    fix_status: Optional[str] = None          # fixed | still_present | unverifiable
+    verified_at: Optional[str] = None         # ISO timestamp of last verification run
+    verification_note: Optional[str] = None   # human-readable outcome summary
 
 
 class ScanStatusResponse(BaseModel):
@@ -90,6 +113,12 @@ class ScanResultResponse(BaseModel):
     execution_graph_present: bool = False
     kev_matches: list[str] = Field(default_factory=list)
     execution_graph: Optional[dict] = None
+    # Phase 2: PTT state — None means scan predates PTT or ran in deterministic mode
+    ptt_state: Optional[dict] = None
+    # Phase 2 P2-05: structured attack chains derived from DAG edges; None on old records
+    attack_chains: Optional[list[dict]] = None
+    # Phase 3: LLM security report — None until GET /scans/{id}/llm-security-report is called
+    llm_security: Optional[dict] = None
 
     model_config = {"from_attributes": True}
 
@@ -126,6 +155,15 @@ class ScanResultResponse(BaseModel):
 
         if self.execution_graph is None:
             self.execution_graph = results_dict.get("execution_graph")
+
+        if self.ptt_state is None:
+            self.ptt_state = scan_metadata.get("ptt_state")
+
+        if self.attack_chains is None:
+            self.attack_chains = results_dict.get("attack_chains")
+
+        if self.llm_security is None:
+            self.llm_security = results_dict.get("llm_security")
 
         return self
 

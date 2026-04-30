@@ -1,16 +1,17 @@
 import React, { useEffect, useRef } from 'react'
+import { SUCCESS, WARN, DANGER } from '@/lib/theme'
 
 interface RiskGaugeProps {
-  score: number   // 0–100
-  size?: number   // diameter in px, default 140
+  score: number
+  size?: number
   animated?: boolean
 }
 
 function scoreToColor(score: number): string {
-  if (score <= 30) return '#22C55E'
-  if (score <= 60) return '#EAB308'
-  if (score <= 80) return '#F97316'
-  return '#EF4444'
+  if (score <= 30) return SUCCESS
+  if (score <= 60) return WARN
+  if (score <= 80) return '#f97316'
+  return DANGER
 }
 
 function scoreLabel(score: number): string {
@@ -33,7 +34,6 @@ export default function RiskGauge({ score, size = 140, animated = true }: RiskGa
   const strokeWidth = size * 0.065
   const trackWidth = strokeWidth * 0.5
 
-  // Arc: goes from 210° to 330° (240° sweep — bottom-open horseshoe)
   const startAngle = 210
   const sweepAngle = 240
 
@@ -45,14 +45,12 @@ export default function RiskGauge({ score, size = 140, animated = true }: RiskGa
     }
   }
 
-  function buildArc(score: number) {
-    const fraction = score / 100
+  function buildArc(s: number) {
+    const fraction = s / 100
     const endAngle = startAngle + sweepAngle * fraction
-
     const start = polarToXY(startAngle, r)
     const end = polarToXY(endAngle, r)
     const largeArc = sweepAngle * fraction > 180 ? 1 : 0
-
     if (fraction === 0) return `M ${start.x} ${start.y}`
     return `M ${start.x} ${start.y} A ${r} ${r} 0 ${largeArc} 1 ${end.x} ${end.y}`
   }
@@ -63,7 +61,6 @@ export default function RiskGauge({ score, size = 140, animated = true }: RiskGa
     return `M ${start.x} ${start.y} A ${r} ${r} 0 1 1 ${end.x} ${end.y}`
   }
 
-  // Animated counter
   useEffect(() => {
     if (!animated) {
       prevScore.current = clampedScore
@@ -76,7 +73,6 @@ export default function RiskGauge({ score, size = 140, animated = true }: RiskGa
 
     const tick = (now: number) => {
       const progress = Math.min((now - start) / duration, 1)
-      // Ease-out cubic
       const eased = 1 - Math.pow(1 - progress, 3)
       const current = from + (to - from) * eased
 
@@ -110,16 +106,13 @@ export default function RiskGauge({ score, size = 140, animated = true }: RiskGa
   return (
     <div className="flex flex-col items-center">
       <svg width={size} height={size * 0.88} viewBox={`0 0 ${size} ${size}`}>
-        {/* Track */}
         <path
           d={buildTrackArc()}
           fill="none"
-          stroke="#1F2937"
+          stroke="#1f2937"
           strokeWidth={trackWidth}
           strokeLinecap="round"
         />
-
-        {/* Glow filter */}
         <defs>
           <filter id="gauge-glow" x="-50%" y="-50%" width="200%" height="200%">
             <feGaussianBlur stdDeviation="3" result="coloredBlur" />
@@ -129,8 +122,6 @@ export default function RiskGauge({ score, size = 140, animated = true }: RiskGa
             </feMerge>
           </filter>
         </defs>
-
-        {/* Arc */}
         <path
           ref={arcRef}
           d={buildArc(animated ? prevScore.current : clampedScore)}
@@ -140,8 +131,6 @@ export default function RiskGauge({ score, size = 140, animated = true }: RiskGa
           strokeLinecap="round"
           filter="url(#gauge-glow)"
         />
-
-        {/* Score number */}
         <text
           ref={textRef}
           x={cx}
@@ -154,21 +143,17 @@ export default function RiskGauge({ score, size = 140, animated = true }: RiskGa
         >
           {animated ? prevScore.current : clampedScore}
         </text>
-
-        {/* /100 */}
         <text
           x={cx}
           y={cy + size * 0.22}
           textAnchor="middle"
-          fill="#4B5563"
+          fill="#4b5563"
           fontSize={size * 0.09}
           fontFamily="Inter, sans-serif"
         >
           / 100
         </text>
       </svg>
-
-      {/* Label */}
       <div
         className="text-xs font-semibold tracking-widest uppercase mt-1"
         style={{ color, letterSpacing: '0.12em' }}

@@ -22,6 +22,8 @@ export interface Finding {
   cve_id?: string
   remediation?: string
   discovered_at: string
+  validated?: 'confirmed' | 'false_positive' | 'pending' | null
+  known_exploited?: boolean
 }
 
 // ─── User / Auth types ────────────────────────────────────────────────
@@ -60,6 +62,7 @@ export interface ScanStatusResponse {
   medium_count: number
   low_count: number
   info_count: number
+  scan_mode?: 'deterministic' | 'adaptive'
 }
 
 export interface ExecutionGraphNode {

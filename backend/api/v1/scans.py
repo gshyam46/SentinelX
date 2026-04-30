@@ -40,6 +40,7 @@ from backend.db.session import get_db
 from backend.models.user import User
 from backend.models.scan import Scan
 from backend.schemas.scan import (
+    AuthConfig,  # noqa: F401 — re-exported so FastAPI can generate the request schema
     ScanRequest,
     ScanResultResponse,
     ScanStatusResponse,
@@ -89,6 +90,29 @@ class AnalysisReportResponse(BaseModel):
     generated_at: str | None = None
 
 
+class VerifyRequest(BaseModel):
+    """Request body for POST /scans/{id}/verify."""
+    findings: list[dict] = Field(..., min_length=1, max_length=20,
+                                 description="Finding dicts as returned by GET /scans/{id}")
+
+
+class FindingVerifyResult(BaseModel):
+    title: str
+    original_severity: str
+    fix_status: str           # fixed | still_present | unverifiable
+    verified_at: str
+    confidence: float
+    note: str
+    validation_method: str | None = None
+
+
+class VerifyResponse(BaseModel):
+    scan_id: uuid.UUID
+    target: str
+    verified_count: int
+    results: list[FindingVerifyResult]
+
+
 # ---------------------------------------------------------------------------
 # Tier helper
 # ---------------------------------------------------------------------------
@@ -129,6 +153,16 @@ async def create_scan(
             ),
         )
 
+    # Authenticated scans are pro-only — credentials enable probing auth-gated endpoints
+    if data.auth_config is not None and tier == "free":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Authenticated scans require a paid subscription. "
+                "Upgrade to SentinelX Pro to scan auth-gated endpoints."
+            ),
+        )
+
     # Active scans require explicit authorisation
     if data.scan_type in ("active", "full") and not data.authorization_confirmed:
         raise HTTPException(
@@ -160,6 +194,15 @@ async def create_scan(
                 ),
             )
 
+    # Build initial results blob — auth_config stored here so the Celery worker can
+    # read it from the DB without passing credentials through the Redis task queue.
+    # Credentials are NEVER logged, returned via API, or included in serialised responses.
+    initial_results: dict | None = None
+    if data.auth_config is not None:
+        initial_results = {
+            "auth_config": data.auth_config.model_dump(exclude_none=True)
+        }
+
     # Persist the scan record
     scan = Scan(
         user_id=current_user.id,
@@ -167,6 +210,7 @@ async def create_scan(
         scan_type=data.scan_type,
         status="pending",
         authorization_confirmed=data.authorization_confirmed,
+        results=initial_results,
     )
     db.add(scan)
     current_user.scan_count += 1
@@ -267,9 +311,13 @@ async def get_scan(
 
     response = ScanResultResponse.model_validate(scan)
 
+    # Strip credentials unconditionally — auth_config is write-only via the API
+    if response.results:
+        response.results = _strip_sensitive_results(response.results)
+
     tier = _user_tier(current_user)
-    if tier == "free" and scan.results:
-        response.results = _gate_free_tier_results(scan.results)
+    if tier == "free" and response.results:
+        response.results = _gate_free_tier_results(response.results)
 
     return response
 
@@ -570,6 +618,214 @@ async def download_scan_pdf(
 
 
 # ---------------------------------------------------------------------------
+# POST /scans/{scan_id}/verify — Find→Fix→Verify (Phase 2 P2-03)
+# ---------------------------------------------------------------------------
+
+@router.post("/{scan_id}/verify", response_model=VerifyResponse)
+async def verify_scan_findings(
+    scan_id: uuid.UUID,
+    data: VerifyRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Re-validate specified findings to check whether developer fixes were effective.
+
+    - Pro tier only — verification requires active re-probing.
+    - Scan must be in `complete` status.
+    - Sends each finding back through the P2-01 validator pipeline.
+    - Interprets the result as fix status: if the probe can no longer confirm
+      the vulnerability, the finding is marked "fixed"; if it re-confirms it,
+      the status is "still_present".
+    - Patches fix_status / verified_at / verification_note back into
+      scan.results["findings"] (matched by title).
+    - Returns per-finding VerifyResult objects.
+    """
+    tier = _user_tier(current_user)
+    if tier == "free":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Find→Fix→Verify requires a paid subscription.",
+        )
+
+    result = await db.execute(
+        select(Scan).where(Scan.id == scan_id, Scan.user_id == current_user.id)
+    )
+    scan = result.scalar_one_or_none()
+    if not scan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found.")
+
+    if scan.status != "complete":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Scan must be complete before running verification.",
+        )
+
+    from backend.modules.pentest.ffv.engine import verify_findings as _verify_findings
+
+    vresults = await _verify_findings(data.findings, scan.domain)
+
+    # Patch fix_status + metadata back into the findings JSONB array (matched by title)
+    existing = (scan.results or {}).get("findings", [])
+    if existing:
+        result_by_title = {vr.title: vr for vr in vresults}
+        patched = False
+        for f in existing:
+            vr = result_by_title.get(f.get("title", ""))
+            if vr:
+                f["fix_status"] = vr.fix_status
+                f["verified_at"] = vr.verified_at
+                f["verification_note"] = vr.note
+                patched = True
+        if patched:
+            scan.results = {**(scan.results or {}), "findings": existing}
+            await db.commit()
+
+    logger.info(
+        "[%s] verify_scan_findings: %d findings checked — fixed=%d still_present=%d unverifiable=%d",
+        scan_id,
+        len(vresults),
+        sum(1 for r in vresults if r.fix_status == "fixed"),
+        sum(1 for r in vresults if r.fix_status == "still_present"),
+        sum(1 for r in vresults if r.fix_status == "unverifiable"),
+    )
+
+    return VerifyResponse(
+        scan_id=scan_id,
+        target=scan.domain,
+        verified_count=len(vresults),
+        results=[FindingVerifyResult(**vr.model_dump()) for vr in vresults],
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /scans/{scan_id}/llm-security-report — Phase 3 LLM security assessment
+# ---------------------------------------------------------------------------
+
+class LLMSecurityReportResponse(BaseModel):
+    scan_id: uuid.UUID
+    target: str
+    llm_risk_score: float
+    checks_run: int
+    issues_found: int
+    risks: list[dict]
+    attack_chains: list[dict] = Field(default_factory=list)
+    ai_endpoints_discovered: list[str] = Field(default_factory=list)
+    executive_summary: str
+    scan_duration: float
+    cached: bool = False
+
+
+@router.get("/{scan_id}/llm-security-report", response_model=LLMSecurityReportResponse)
+async def get_llm_security_report(
+    scan_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    force_refresh: bool = False,
+):
+    """
+    Run the OWASP LLM Top 10 security assessment against the scan's target domain.
+
+    - Pro tier only — active probing requires authorization.
+    - Results are cached in scan.results["llm_security"] after first run.
+    - Pass ?force_refresh=true to bypass cache and re-run all 10 checks.
+    - The scan must exist and belong to the current user; it does NOT need to
+      be complete (LLM checks run independently against the live target).
+    """
+    tier = _user_tier(current_user)
+    if tier == "free":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="LLM security assessment requires a paid subscription.",
+        )
+
+    result = await db.execute(
+        select(Scan).where(Scan.id == scan_id, Scan.user_id == current_user.id)
+    )
+    scan = result.scalar_one_or_none()
+    if not scan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found.")
+
+    scan_results = scan.results or {}
+
+    # Return cached report unless force_refresh requested
+    cached_report: dict | None = scan_results.get("llm_security")
+    if cached_report and not force_refresh:
+        logger.info("[%s] Returning cached LLM security report", scan_id)
+        return LLMSecurityReportResponse(
+            scan_id=scan_id,
+            target=scan.domain,
+            cached=True,
+            **{k: cached_report[k] for k in LLMSecurityReportResponse.model_fields
+               if k not in ("scan_id", "target", "cached") and k in cached_report},
+        )
+
+    # Build recon context from existing scan results
+    recon_result: dict = {}
+    findings: list[dict] = scan_results.get("findings", [])
+    if "recon" in scan_results:
+        recon_result = scan_results["recon"]
+    elif "scan_metadata" in scan_results:
+        recon_result = {"headers": scan_results["scan_metadata"].get("headers", {})}
+
+    # Run the LLM security assessment
+    from backend.modules.ai.llm_security.analyzer import get_llm_security_analyzer
+
+    analyzer = get_llm_security_analyzer()
+    try:
+        report = await analyzer.analyze(
+            target=scan.domain,
+            recon_result=recon_result,
+            findings=findings,
+        )
+    except Exception as exc:
+        logger.error("[%s] LLM security analysis failed: %s", scan_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"LLM security analysis failed: {exc}",
+        )
+
+    # Persist report to scan results JSONB
+    report_dict = report.model_dump()
+    scan.results = {**scan_results, "llm_security": report_dict}
+    await db.commit()
+
+    logger.info(
+        "[%s] LLM security report stored — score=%.1f issues=%d",
+        scan_id, report.llm_risk_score, report.issues_found,
+    )
+
+    return LLMSecurityReportResponse(
+        scan_id=scan_id,
+        target=report.target,
+        llm_risk_score=report.llm_risk_score,
+        checks_run=report.checks_run,
+        issues_found=report.issues_found,
+        risks=[r.model_dump() for r in report.risks],
+        attack_chains=report.attack_chains,
+        ai_endpoints_discovered=report.ai_endpoints_discovered,
+        executive_summary=report.executive_summary,
+        scan_duration=report.scan_duration,
+        cached=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sensitive field scrubbing — applied to ALL tiers before any response
+# ---------------------------------------------------------------------------
+
+def _strip_sensitive_results(results: dict) -> dict:
+    """
+    Remove credential fields from scan results before any API response.
+    Applied unconditionally — tier does not affect this stripping.
+    auth_config is write-only: stored at scan creation, never readable via API.
+    """
+    stripped = dict(results)
+    stripped.pop("auth_config", None)
+    return stripped
+
+
+# ---------------------------------------------------------------------------
 # Free tier result gating (progressive findings)
 # ---------------------------------------------------------------------------
 
@@ -609,7 +865,8 @@ def _gate_free_tier_results(results: dict) -> dict:
             "detailed remediation, attack chain analysis, and PDF reports."
         )
 
-    # Strip AI report details from free tier (available via /report endpoint with gating)
+    # Strip sensitive and pro-only fields
     gated.pop("ai_report", None)
+    gated.pop("auth_config", None)  # defence-in-depth — also stripped by _strip_sensitive_results
 
     return gated

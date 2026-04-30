@@ -457,6 +457,69 @@ async def _run_passive_recon_loop(
 
 
 # ---------------------------------------------------------------------------
+# PTT expansion helper (Phase 2, ADR-024) — adaptive mode only
+# ---------------------------------------------------------------------------
+
+async def _run_ptt_if_adaptive(
+    scan_id: uuid.UUID,
+    target: str,
+    scan_metadata: dict,
+) -> dict | None:
+    """
+    PTT expansion pass for adaptive scans.
+    Reads current findings from DB (written incrementally by _db_append_finding),
+    runs up to 2 PTT expansion iterations, persists PTT-sourced findings, and
+    returns the serialised PTTState or None when no nodes were produced.
+    """
+    from backend.agents.ptt import PTTState
+    from backend.agents.ptt_orchestrator import dispatch_pending_ptt_nodes, expand_ptt
+    from backend.db.session import async_session_factory
+    from backend.models.scan import Scan
+
+    try:
+        async with async_session_factory() as db:
+            result = await db.execute(select(Scan).where(Scan.id == scan_id))
+            scan = result.scalar_one_or_none()
+            if not scan or not scan.results:
+                return None
+            findings: list[dict] = list(scan.results.get("findings", []))
+    except Exception as exc:
+        logger.warning("[%s] PTT: DB read failed — skipping PTT expansion: %s", scan_id, exc)
+        return None
+
+    if not findings:
+        logger.info("[%s] PTT: no findings after first pass — skipping", scan_id)
+        return None
+
+    execution_graph: dict = scan_metadata.get("execution_graph") or {}
+    kev_matches: list[str] = scan_metadata.get("kev_matches") or []
+
+    ptt = PTTState(scan_id=str(scan_id))
+
+    for iteration in range(2):
+        ptt = await expand_ptt(ptt, findings, execution_graph, kev_matches)
+        new_findings, ptt = await dispatch_pending_ptt_nodes(ptt, target, scan_id)
+
+        for fd in new_findings:
+            try:
+                await _async_db_write(lambda f=fd: _db_append_finding(scan_id, f))
+            except Exception as exc:
+                logger.warning("[%s] PTT: failed to persist finding: %s", scan_id, exc)
+
+        findings.extend(new_findings)
+        logger.info(
+            "[%s] PTT iteration %d: %d new findings, %d total nodes",
+            scan_id, iteration + 1, len(new_findings), len(ptt.nodes),
+        )
+
+        if not new_findings:
+            logger.info("[%s] PTT: no new findings in iteration %d — stopping early", scan_id, iteration + 1)
+            break
+
+    return ptt.export() if ptt.nodes else None
+
+
+# ---------------------------------------------------------------------------
 # @task: orchestrate_scan
 # ---------------------------------------------------------------------------
 
@@ -527,6 +590,17 @@ def orchestrate_scan(
                     task_self=self,
                 )
             )
+            # PTT expansion on active phase (adaptive mode only)
+            if scan_mode == "adaptive" and active_result["findings_count"] > 0:
+                ptt_state = asyncio.run(
+                    _run_ptt_if_adaptive(
+                        scan_id=parsed_scan_id,
+                        target=target,
+                        scan_metadata=active_result["scan_metadata"],
+                    )
+                )
+                if ptt_state:
+                    active_result["scan_metadata"]["ptt_state"] = ptt_state
             active_meta = active_result["scan_metadata"]
             full_scan_metadata: dict = {
                 **active_meta,
@@ -560,6 +634,17 @@ def orchestrate_scan(
                     task_self=self,
                 )
             )
+            # PTT expansion (adaptive mode only — deterministic baseline unchanged)
+            if scan_mode == "adaptive" and result["findings_count"] > 0:
+                ptt_state = asyncio.run(
+                    _run_ptt_if_adaptive(
+                        scan_id=parsed_scan_id,
+                        target=target,
+                        scan_metadata=result["scan_metadata"],
+                    )
+                )
+                if ptt_state:
+                    result["scan_metadata"]["ptt_state"] = ptt_state
 
         _sync_db_write(
             lambda: _db_complete_scan(

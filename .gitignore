@@ -28,7 +28,8 @@ env/
 
 # Claude AI files
 .claude/
-
+DECISIONS.md
+PROGRESS.md
 # Python
 __pycache__/
 *.pyc

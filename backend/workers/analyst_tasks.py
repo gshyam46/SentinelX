@@ -52,14 +52,21 @@ async def _db_get_findings(scan_id: uuid.UUID) -> tuple[list[dict], dict]:
         from sqlalchemy import select
         result = await db.execute(select(Scan).where(Scan.id == scan_id))
         scan = result.scalar_one()
-        findings = (scan.results or {}).get("findings", [])
+        results = scan.results or {}
+        findings = results.get("findings", [])
         return findings, {
             "domain": scan.domain,
             "scan_type": scan.scan_type,
+            "execution_graph": results.get("execution_graph"),
+            "auth_config": results.get("auth_config"),  # None for unauthenticated scans
         }
 
 
-async def _db_save_ai_report(scan_id: uuid.UUID, report: dict) -> None:
+async def _db_save_ai_report(
+    scan_id: uuid.UUID,
+    report: dict,
+    attack_chains: list[dict] | None = None,
+) -> None:
     from backend.db.session import async_session_factory
     from backend.models.scan import Scan
     from sqlalchemy import select
@@ -72,11 +79,14 @@ async def _db_save_ai_report(scan_id: uuid.UUID, report: dict) -> None:
         # accessible to the analyst context and any future downstream readers
         # without having to dig into ai_report.
         kev_matches: list[str] = report.get("kev_matches", [])
-        scan.results = {
+        new_results: dict = {
             **existing,
             "ai_report": report,
             "kev_matches": kev_matches,
         }
+        if attack_chains is not None:
+            new_results["attack_chains"] = attack_chains
+        scan.results = new_results
         scan.current_step = "AI analysis complete"
         await db.commit()
 
@@ -154,7 +164,7 @@ def _sync_redis_publish(channel: str, payload: dict) -> None:
     acks_late=True,
     queue="analyst",
 )
-def run_analyst(scan_id: str) -> dict:
+async def run_analyst(scan_id: str) -> dict:
     """
     Analyst task — chained after orchestrate_scan.
 
@@ -173,6 +183,8 @@ def run_analyst(scan_id: str) -> dict:
         # ── 1. Fetch findings ──────────────────────────────────────────────
         findings, scan_meta = _sync_db_run(lambda: _db_get_findings(_scan_id))
         domain = scan_meta["domain"]
+        execution_graph: dict | None = scan_meta.get("execution_graph")
+        auth_config: dict | None = scan_meta.get("auth_config")
 
         logger.info("[%s] Analyst processing %d findings", scan_id, len(findings))
 
@@ -189,7 +201,12 @@ def run_analyst(scan_id: str) -> dict:
             },
         }
 
-        # ── 3. Agent 2 analysis (LLM + RAG, with rule-based fallback) ─────
+        # ── 3. Validation layer (Phase 2) ──────────────────────────────────
+        from backend.modules.pentest.validation.engine import run_validation
+        validated_findings = await run_validation(findings, domain, auth_config=auth_config)
+        scan_results["all_findings"] = validated_findings
+
+        # ── 4. Agent 2 analysis (LLM + RAG, with rule-based fallback) ─────
         report = asyncio.run(analyze_findings(scan_results))
 
         # Stamp metadata
@@ -197,8 +214,27 @@ def run_analyst(scan_id: str) -> dict:
         report["generated_at"] = datetime.now(timezone.utc).isoformat()
         report["model_used"] = report.get("model_used", settings.LITELLM_MODEL)
 
-        # ── 3. Persist report ──────────────────────────────────────────────
-        _sync_db_run(lambda: _db_save_ai_report(_scan_id, report))
+        # ── 5. Attack chain derivation (Phase 2 P2-05) ────────────────────
+        from backend.modules.pentest.attack_chain import (
+            derive_chains,
+            narrate_chains,
+        )
+        _attack_chains: list[dict] | None = None
+        if execution_graph:
+            _raw_chains = derive_chains(
+                execution_graph,
+                validated_findings,
+                report.get("kev_matches", []),
+            )
+            if _raw_chains:
+                _raw_chains = await narrate_chains(_raw_chains)
+            _attack_chains = [c.model_dump() for c in _raw_chains]
+            logger.info(
+                "[%s] Attack chain derivation: %d chain(s)", scan_id, len(_raw_chains)
+            )
+
+        # ── 6. Persist report + attack chains ─────────────────────────────
+        _sync_db_run(lambda: _db_save_ai_report(_scan_id, report, _attack_chains))
         _sync_redis_publish(
             redis_channel,
             {
