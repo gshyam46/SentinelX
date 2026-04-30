@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react'
-import { useScanLive, type LiveEvent, type Finding } from '@/lib/api'
-import { severityColor } from '@/lib/utils'
-import { ACCENT, SUCCESS, WARN, SEVERITY_COLOR } from '@/lib/theme'
+import { useScanLive, type LiveEvent, type Finding } from '../lib/api'
+import { severityColor } from '../lib/utils'
+import { ACCENT, SUCCESS, WARN, SEVERITY_COLOR } from '../lib/theme'
 import { Activity, Cpu, CheckCircle2, AlertCircle, Zap, BrainCircuit } from 'lucide-react'
 
 interface LiveAgentFeedProps {

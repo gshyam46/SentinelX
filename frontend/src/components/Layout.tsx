@@ -4,9 +4,9 @@ import {
   Shield, LayoutDashboard, Search, FileText,
   Settings, LogOut, ChevronRight,
 } from 'lucide-react'
-import { api } from '@/lib/api'
-import { useAuth } from '@/lib/auth'
-import { ACCENT, BG } from '@/lib/theme'
+import { api } from '../lib/api'
+import { useAuth } from '../lib/auth'
+import { ACCENT, BG } from '../lib/theme'
 
 const NAV_ITEMS = [
   { to: '/',         icon: LayoutDashboard, label: 'Dashboard' },

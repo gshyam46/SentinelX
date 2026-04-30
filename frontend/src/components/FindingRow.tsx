@@ -1,8 +1,8 @@
 import React from 'react'
-import { type Finding } from '@/lib/api'
-import { severityColor } from '@/lib/utils'
+import { type Finding } from '../lib/api'
+import { severityColor } from '../lib/utils'
 import { Lock, CheckCircle2, XCircle, Clock } from 'lucide-react'
-import { WARN } from '@/lib/theme'
+import { WARN } from '../lib/theme'
 
 interface FindingRowProps {
   finding: Finding

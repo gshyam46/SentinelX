@@ -14,7 +14,7 @@ import {
   MarkerType,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { SEVERITY_COLOR, BG, WARN } from '@/lib/theme'
+import { SEVERITY_COLOR, BG, WARN } from '../lib/theme'
 import { GitFork } from 'lucide-react'
 
 const TOOL_BG = '#1e3a5f'

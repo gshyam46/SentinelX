@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { Shield, Mail, Lock, Eye, EyeOff, AlertTriangle, ArrowRight } from 'lucide-react'
-import { useAuth } from '@/lib/auth'
+import { useAuth } from '../lib/auth'
 
 export default function Login() {
   const { login } = useAuth()

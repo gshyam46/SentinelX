@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react'
-import { SUCCESS, WARN, DANGER } from '@/lib/theme'
+import { SUCCESS, WARN, DANGER } from '../lib/theme'
 
 interface RiskGaugeProps {
   score: number

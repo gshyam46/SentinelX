@@ -5,10 +5,10 @@ import {
   Zap, Lock, Globe, Clock, BarChart3, TrendingUp,
   X, Plus, ChevronRight,
 } from 'lucide-react'
-import { api, type ScanStatusResponse, type ScanType } from '@/lib/api'
-import { useAuth } from '@/lib/auth'
-import { riskColor, formatRelativeTime } from '@/lib/utils'
-import { ACCENT, SEVERITY_COLOR, BG, DANGER, WARN } from '@/lib/theme'
+import { api, type ScanStatusResponse, type ScanType } from '../lib/api'
+import { useAuth } from '../lib/auth'
+import { riskColor, formatRelativeTime } from '../lib/utils'
+import { ACCENT, SEVERITY_COLOR, BG, DANGER, WARN } from '../lib/theme'
 
 // ── New Scan Modal ─────────────────────────────────────────────────────────────
 

@@ -1,10 +1,10 @@
 import React from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { AuthProvider, useAuth } from '@/lib/auth'
-import Layout from '@/components/Layout'
-import Dashboard from '@/pages/Dashboard'
-import ScanDetail from '@/pages/ScanDetail'
-import Login from '@/pages/Login'
+import { AuthProvider, useAuth } from './lib/auth'
+import Layout from './components/Layout'
+import Dashboard from './pages/Dashboard'
+import ScanDetail from './pages/ScanDetail'
+import Login from './pages/Login'
 
 /** Redirect unauthenticated users to /login */
 function ProtectedRoute({ children }: { children: React.ReactNode }) {

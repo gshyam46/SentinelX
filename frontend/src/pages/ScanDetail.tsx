@@ -6,12 +6,12 @@ import {
   CheckCircle2, X, ChevronRight, Cpu, Activity,
   Wrench, BookOpen, ShieldAlert, Link2,
 } from 'lucide-react'
-import { api, useScanLive, type ScanResultResponse, type Finding, type AnalysisReport, type LiveEvent } from '@/lib/api'
-import { severityColor, riskColor, formatRelativeTime } from '@/lib/utils'
-import { ACCENT, SEVERITY_COLOR, BG, WARN, SUCCESS, DANGER } from '@/lib/theme'
-import RiskGauge from '@/components/RiskGauge'
-import FindingRow from '@/components/FindingRow'
-import ExecutionGraph from '@/components/ExecutionGraph'
+import { api, useScanLive, type ScanResultResponse, type Finding, type AnalysisReport, type LiveEvent } from '../lib/api'
+import { severityColor, riskColor, formatRelativeTime } from '../lib/utils'
+import { ACCENT, SEVERITY_COLOR, BG, WARN, SUCCESS, DANGER } from '../lib/theme'
+import RiskGauge from '../components/RiskGauge'
+import FindingRow from '../components/FindingRow'
+import ExecutionGraph from '../components/ExecutionGraph'
 
 // ── OWASP ─────────────────────────────────────────────────────────────────────
 
