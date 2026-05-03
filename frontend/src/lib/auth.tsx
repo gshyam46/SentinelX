@@ -85,8 +85,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(null)
   }
 
-  // 'paid' is the DB value for pro-tier users; 'pro' and 'enterprise' are also pro
-  const isPro = user?.tier === 'pro' || user?.tier === 'paid' || user?.tier === 'enterprise'
+  // 'paid' is the DB value for pro-tier users; 'pro' and 'enterprise' are also pro.
+  // In local dev, VITE_DEV_BYPASS_SECRET forces isPro=true so the UI reflects full access.
+  const devBypass = !!import.meta.env.VITE_DEV_BYPASS_SECRET
+  const isPro = devBypass || user?.tier === 'pro' || user?.tier === 'paid' || user?.tier === 'enterprise'
 
   return (
     <AuthContext.Provider value={{ user, isPro, isLoading, login, logout }}>

@@ -4,13 +4,18 @@ Runs after orchestrate_scan completes.
 
 Chain: orchestrate_scan → run_analyst → generate_report
 
-The analyst fetches all findings from the DB, generates a structured
-AnalysisReport via LiteLLM, then chains to generate_report (Agent 3).
+Schema contract (scan.results JSONB — analyst ownership):
+  analysis.ai_report      — written ONLY by _db_save_ai_report
+  analysis.kev_matches    — written ONLY by _db_save_ai_report
+  analysis.attack_chains  — written ONLY by _db_save_ai_report
+  report.remediation_plan — written ONLY by _db_save_remediation_plan
+  report_ready            — written ONLY by _mark_report_ready
+
+All writes use atomic PostgreSQL || operator — scan_findings is never touched.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import traceback
@@ -19,12 +24,28 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import select, text
+
 from backend.workers.celery_app import celery_app
 from backend.config import get_settings
+from backend.db.session import run_in_worker_loop, worker_async_session_factory
 from backend.modules.ai.analyst_agent import analyze_findings
 
 logger = logging.getLogger("sentinelx.workers.analyst")
 settings = get_settings()
+
+# ---------------------------------------------------------------------------
+# Atomic SQL constants — analyst owns the "analysis" and "report" top-level keys.
+# ---------------------------------------------------------------------------
+
+_MERGE_SQL = text(
+    "UPDATE scans SET results = COALESCE(results, '{}') || :patch::jsonb WHERE id = :scan_id"
+)
+
+_MERGE_STEP_SQL = text(
+    "UPDATE scans SET results = COALESCE(results, '{}') || :patch::jsonb,"
+    " current_step = :step WHERE id = :scan_id"
+)
 
 
 def _risk_level(score: float) -> str:
@@ -40,25 +61,24 @@ def _risk_level(score: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DB helpers
+# DB helpers — all use atomic SQL, never touch scan_findings
 # ---------------------------------------------------------------------------
 
 async def _db_get_findings(scan_id: uuid.UUID) -> tuple[list[dict], dict]:
-    """Return (findings_list, scan_meta_dict)."""
-    from backend.db.session import async_session_factory
+    """Return (findings_list, scan_meta_dict).  Reads scan_findings with legacy fallback."""
     from backend.models.scan import Scan
 
-    async with async_session_factory() as db:
-        from sqlalchemy import select
+    async with worker_async_session_factory() as db:
         result = await db.execute(select(Scan).where(Scan.id == scan_id))
         scan = result.scalar_one()
         results = scan.results or {}
-        findings = results.get("findings", [])
+        # scan_findings is the new key; fall back to findings for old scan records
+        findings = results.get("scan_findings") or results.get("findings", [])
         return findings, {
             "domain": scan.domain,
             "scan_type": scan.scan_type,
             "execution_graph": results.get("execution_graph"),
-            "auth_config": results.get("auth_config"),  # None for unauthenticated scans
+            "auth_config": results.get("auth_config"),
         }
 
 
@@ -67,65 +87,64 @@ async def _db_save_ai_report(
     report: dict,
     attack_chains: list[dict] | None = None,
 ) -> None:
-    from backend.db.session import async_session_factory
-    from backend.models.scan import Scan
-    from sqlalchemy import select
+    """
+    Write AI analysis results under the 'analysis' key.
 
-    async with async_session_factory() as db:
-        result = await db.execute(select(Scan).where(Scan.id == scan_id))
-        scan = result.scalar_one()
-        existing = scan.results or {}
-        # kev_matches is promoted to a top-level results key so it is
-        # accessible to the analyst context and any future downstream readers
-        # without having to dig into ai_report.
-        kev_matches: list[str] = report.get("kev_matches", [])
-        new_results: dict = {
-            **existing,
-            "ai_report": report,
-            "kev_matches": kev_matches,
-        }
-        if attack_chains is not None:
-            new_results["attack_chains"] = attack_chains
-        scan.results = new_results
-        scan.current_step = "AI analysis complete"
+    Atomic || merge — never touches scan_findings, report, or any other key.
+    """
+    kev_matches: list[str] = report.get("kev_matches", [])
+    analysis: dict = {
+        "ai_report": report,
+        "kev_matches": kev_matches,
+    }
+    if attack_chains is not None:
+        analysis["attack_chains"] = attack_chains
+
+    async with worker_async_session_factory() as db:
+        await db.execute(
+            _MERGE_STEP_SQL,
+            {
+                "patch": json.dumps({"analysis": analysis}, default=str),
+                "step": "AI analysis complete",
+                "scan_id": scan_id,  # uuid.UUID
+            },
+        )
         await db.commit()
 
 
 async def _db_save_remediation_plan(scan_id: uuid.UUID, plan: dict) -> None:
-    from backend.db.session import async_session_factory
-    from backend.models.scan import Scan
-    from sqlalchemy import select
-
-    async with async_session_factory() as db:
-        result = await db.execute(select(Scan).where(Scan.id == scan_id))
-        scan = result.scalar_one()
-        existing = scan.results or {}
-        scan.results = {**existing, "remediation_plan": plan}
+    """Write remediation plan under 'report' key — never touches scan_findings or analysis."""
+    async with worker_async_session_factory() as db:
+        await db.execute(
+            _MERGE_SQL,
+            {
+                "patch": json.dumps({"report": {"remediation_plan": plan}}, default=str),
+                "scan_id": scan_id,  # uuid.UUID
+            },
+        )
         await db.commit()
 
 
 async def _db_fail_analyst(scan_id: uuid.UUID, error: str) -> None:
-    from backend.db.session import async_session_factory
-    from backend.models.scan import Scan
-    from sqlalchemy import select
-
-    async with async_session_factory() as db:
-        result = await db.execute(select(Scan).where(Scan.id == scan_id))
-        scan = result.scalar_one_or_none()
-        if scan:
-            existing = scan.results or {}
-            scan.results = {**existing, "analyst_error": error[:2000]}
-            scan.current_step = "Analysis failed — see error"
-            await db.commit()
+    async with worker_async_session_factory() as db:
+        await db.execute(
+            _MERGE_STEP_SQL,
+            {
+                "patch": json.dumps({"analyst_error": error[:2000]}),
+                "step": "Analysis failed — see error",
+                "scan_id": scan_id,  # uuid.UUID
+            },
+        )
+        await db.commit()
 
 
 def _sync_db_run(coro_factory, *, max_retries: int = 3, base_delay: float = 0.5) -> Any:
-    """Synchronous retry wrapper for async DB coroutines (mirrors scan_tasks._sync_db_write)."""
+    """Synchronous retry wrapper for async DB coroutines — uses persistent worker loop."""
     import time
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            return asyncio.run(coro_factory())
+            return run_in_worker_loop(coro_factory())
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < max_retries:
@@ -140,48 +159,41 @@ def _sync_db_run(coro_factory, *, max_retries: int = 3, base_delay: float = 0.5)
 
 def _sync_redis_publish(channel: str, payload: dict) -> None:
     try:
-        import redis.asyncio as aioredis
-
-        async def _publish() -> None:
-            r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-            try:
-                await r.publish(channel, json.dumps(payload))
-            finally:
-                await r.aclose()
-
-        asyncio.run(_publish())
+        import redis as sync_redis
+        r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+        r.publish(channel, json.dumps(payload))
+        r.close()
     except Exception as exc:  # noqa: BLE001
         logger.debug("Analyst Redis publish skipped: %s", exc)
 
 
+async def _async_redis_publish(channel: str, payload: dict) -> None:
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        try:
+            await r.publish(channel, json.dumps(payload))
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Analyst async Redis publish skipped: %s", exc)
+
+
 # ---------------------------------------------------------------------------
-# @task: run_analyst
+# run_analyst — async implementation
 # ---------------------------------------------------------------------------
 
-@celery_app.task(
-    name="run_analyst",
-    track_started=True,
-    acks_late=True,
-    queue="analyst",
-)
-async def run_analyst(scan_id: str) -> dict:
-    """
-    Analyst task — chained after orchestrate_scan.
-
-    1. Fetch all findings from DB.
-    2. Run LLM AnalysisReport generation (with rule-based fallback).
-    3. Store ai_report in scan.results.
-    4. Chain to generate_report (Agent 3 — remediation + report_ready).
-    """
+async def _run_analyst_async(scan_id: str) -> dict:
+    """Full async body of the analyst task — called via run_in_worker_loop."""
     _scan_id = uuid.UUID(scan_id)
     redis_channel = f"scan:{scan_id}:events"
 
     logger.info("[%s] run_analyst starting", scan_id)
-    _sync_redis_publish(redis_channel, {"type": "analyst_started", "scan_id": scan_id})
+    await _async_redis_publish(redis_channel, {"type": "analyst_started", "scan_id": scan_id})
 
     try:
         # ── 1. Fetch findings ──────────────────────────────────────────────
-        findings, scan_meta = _sync_db_run(lambda: _db_get_findings(_scan_id))
+        findings, scan_meta = await _db_get_findings(_scan_id)
         domain = scan_meta["domain"]
         execution_graph: dict | None = scan_meta.get("execution_graph")
         auth_config: dict | None = scan_meta.get("auth_config")
@@ -194,48 +206,39 @@ async def run_analyst(scan_id: str) -> dict:
             "domain": domain,
             "all_findings": findings,
             "summary": {
-                "risk_score": 0,  # computed by agent
+                "risk_score": 0,
                 "risk_level": "Unknown",
                 "total_findings": len(findings),
                 "severity_counts": dict(severity_counts),
             },
         }
 
-        # ── 3. Validation layer (Phase 2) ──────────────────────────────────
+        # ── 3. Validation layer ────────────────────────────────────────────
         from backend.modules.pentest.validation.engine import run_validation
         validated_findings = await run_validation(findings, domain, auth_config=auth_config)
         scan_results["all_findings"] = validated_findings
 
         # ── 4. Agent 2 analysis (LLM + RAG, with rule-based fallback) ─────
-        report = asyncio.run(analyze_findings(scan_results))
-
-        # Stamp metadata
+        report = await analyze_findings(scan_results)
         report["scan_id"] = scan_id
         report["generated_at"] = datetime.now(timezone.utc).isoformat()
         report["model_used"] = report.get("model_used", settings.LITELLM_MODEL)
 
-        # ── 5. Attack chain derivation (Phase 2 P2-05) ────────────────────
-        from backend.modules.pentest.attack_chain import (
-            derive_chains,
-            narrate_chains,
-        )
+        # ── 5. Attack chain derivation ─────────────────────────────────────
+        from backend.modules.pentest.attack_chain import derive_chains, narrate_chains
         _attack_chains: list[dict] | None = None
         if execution_graph:
             _raw_chains = derive_chains(
-                execution_graph,
-                validated_findings,
-                report.get("kev_matches", []),
+                execution_graph, validated_findings, report.get("kev_matches", [])
             )
             if _raw_chains:
                 _raw_chains = await narrate_chains(_raw_chains)
             _attack_chains = [c.model_dump() for c in _raw_chains]
-            logger.info(
-                "[%s] Attack chain derivation: %d chain(s)", scan_id, len(_raw_chains)
-            )
+            logger.info("[%s] Attack chains: %d derived", scan_id, len(_raw_chains))
 
-        # ── 6. Persist report + attack chains ─────────────────────────────
-        _sync_db_run(lambda: _db_save_ai_report(_scan_id, report, _attack_chains))
-        _sync_redis_publish(
+        # ── 6. Persist report + attack chains (atomic, owns 'analysis' key) ──
+        await _db_save_ai_report(_scan_id, report, _attack_chains)
+        await _async_redis_publish(
             redis_channel,
             {
                 "type": "analyst_complete",
@@ -245,7 +248,7 @@ async def run_analyst(scan_id: str) -> dict:
             },
         )
 
-        # ── 4. Chain to report generation (always — no follow-up mini-scans) ─
+        # ── 7. Chain to report generation ─────────────────────────────────
         generate_report.delay(scan_id)
 
         logger.info("[%s] run_analyst done — risk_score=%s", scan_id, report.get("risk_score"))
@@ -258,8 +261,8 @@ async def run_analyst(scan_id: str) -> dict:
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error("[%s] run_analyst CRASHED:\n%s", scan_id, tb)
-        _sync_db_run(lambda: _db_fail_analyst(_scan_id, tb))
-        _sync_redis_publish(
+        await _db_fail_analyst(_scan_id, tb)
+        await _async_redis_publish(
             redis_channel,
             {"type": "analyst_failed", "scan_id": scan_id, "error": str(exc)},
         )
@@ -267,7 +270,22 @@ async def run_analyst(scan_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# @task: generate_report  (terminal task — runs remediation agent, marks ready)
+# @task: run_analyst  (sync wrapper — Celery prefork compatible)
+# ---------------------------------------------------------------------------
+
+@celery_app.task(
+    name="run_analyst",
+    track_started=True,
+    acks_late=True,
+    queue="analyst",
+)
+def run_analyst(scan_id: str) -> dict:
+    """Analyst task — sync wrapper around _run_analyst_async."""
+    return run_in_worker_loop(_run_analyst_async(scan_id))
+
+
+# ---------------------------------------------------------------------------
+# @task: generate_report  (terminal task)
 # ---------------------------------------------------------------------------
 
 @celery_app.task(
@@ -277,25 +295,24 @@ async def run_analyst(scan_id: str) -> dict:
     queue="analyst",
 )
 def generate_report(scan_id: str) -> dict:
-    """
-    Terminal task — generates a structured PDF/JSON report from ai_report data.
-    This is a stub; the full PDF renderer uses ReportLab (backend/reports/).
-    """
+    """Terminal task — runs remediation agent and marks report_ready."""
     _scan_id = uuid.UUID(scan_id)
     redis_channel = f"scan:{scan_id}:events"
 
     logger.info("[%s] generate_report starting", scan_id)
 
     async def _fetch_report_data() -> dict:
-        from backend.db.session import async_session_factory
         from backend.models.scan import Scan
-        from sqlalchemy import select
 
-        async with async_session_factory() as db:
+        async with worker_async_session_factory() as db:
             result = await db.execute(select(Scan).where(Scan.id == _scan_id))
             scan = result.scalar_one()
-            findings = (scan.results or {}).get("findings", [])
-            ai_report = (scan.results or {}).get("ai_report", {})
+            results = scan.results or {}
+            # scan_findings key (new schema); fallback to findings for old records
+            findings = results.get("scan_findings") or results.get("findings", [])
+            # ai_report under analysis key (new schema); fallback to top-level
+            analysis = results.get("analysis") or {}
+            ai_report = analysis.get("ai_report") or results.get("ai_report") or {}
             return {
                 "domain": scan.domain,
                 "scan_type": scan.scan_type,
@@ -305,7 +322,6 @@ def generate_report(scan_id: str) -> dict:
                 "risk_score": scan.risk_score,
                 "created_at": scan.created_at.isoformat() if scan.created_at else None,
                 "completed_at": scan.completed_at.isoformat() if scan.completed_at else None,
-                # Adapts DB structure → RemediationAgent.advise() expected shape
                 "scan_results_for_remediation": {
                     "domain": scan.domain,
                     "all_findings": findings,
@@ -324,24 +340,24 @@ def generate_report(scan_id: str) -> dict:
             analyst_output=data.get("ai_report"),
         )
 
-    async def _mark_report_ready():
-        from backend.db.session import async_session_factory
-        from backend.models.scan import Scan
-        from sqlalchemy import select
-
-        async with async_session_factory() as db:
-            result = await db.execute(select(Scan).where(Scan.id == _scan_id))
-            scan = result.scalar_one()
-            scan.current_step = "Report ready"
-            existing = scan.results or {}
-            scan.results = {**existing, "report_ready": True}
+    async def _mark_report_ready() -> None:
+        """Atomic write — sets report_ready at top level (frontend compatibility)."""
+        async with worker_async_session_factory() as db:
+            await db.execute(
+                text(
+                    "UPDATE scans SET"
+                    " results = COALESCE(results, '{}') || :patch::jsonb,"
+                    " current_step = 'Report ready'"
+                    " WHERE id = :scan_id"
+                ),
+                {"patch": json.dumps({"report_ready": True}), "scan_id": _scan_id},  # uuid.UUID
+            )
             await db.commit()
 
     try:
-        data = asyncio.run(_fetch_report_data())
+        data = run_in_worker_loop(_fetch_report_data())
 
-        # Run Agent 3 — Remediation Advisor
-        remediation_plan = asyncio.run(_run_remediation(data))
+        remediation_plan = run_in_worker_loop(_run_remediation(data))
         _sync_db_run(lambda: _db_save_remediation_plan(_scan_id, remediation_plan))
         logger.info(
             "[%s] Remediation plan generated — %d items",

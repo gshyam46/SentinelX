@@ -30,6 +30,23 @@ class ScanRequest(BaseModel):
     scan_mode: str = Field(default="adaptive", pattern="^(deterministic|adaptive)$")
     authorization_confirmed: bool = False
     auth_config: Optional[AuthConfig] = None
+    llm_endpoint: Optional[str] = Field(
+        default=None,
+        description=(
+            "Explicit LLM API endpoint (e.g. https://api.example.com/v1/chat/completions). "
+            "When provided, pre-flight detection is skipped and the endpoint is tested directly."
+        ),
+    )
+
+    @field_validator("llm_endpoint")
+    @classmethod
+    def validate_llm_endpoint(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip().rstrip("/")
+        if not re.match(r"^https?://[^\s/$.?#].[^\s]*$", v):
+            raise ValueError("llm_endpoint must be a full HTTP or HTTPS URL")
+        return v
 
     @field_validator("domain")
     @classmethod
@@ -148,8 +165,16 @@ class ScanResultResponse(BaseModel):
             elif results_dict.get("execution_graph") is not None:
                 self.execution_graph_present = True
 
+        # analysis key (new schema) contains ai_report, kev_matches, attack_chains.
+        # Fall back to top-level keys for records written before the schema migration.
+        analysis_data: dict = results_dict.get("analysis") or {}
+
         if not self.kev_matches:
-            stored_kev = scan_metadata.get("kev_matches")
+            stored_kev = (
+                analysis_data.get("kev_matches")
+                or scan_metadata.get("kev_matches")
+                or results_dict.get("kev_matches")
+            )
             if stored_kev:
                 self.kev_matches = list(stored_kev)
 
@@ -160,7 +185,10 @@ class ScanResultResponse(BaseModel):
             self.ptt_state = scan_metadata.get("ptt_state")
 
         if self.attack_chains is None:
-            self.attack_chains = results_dict.get("attack_chains")
+            self.attack_chains = (
+                analysis_data.get("attack_chains")
+                or results_dict.get("attack_chains")
+            )
 
         if self.llm_security is None:
             self.llm_security = results_dict.get("llm_security")

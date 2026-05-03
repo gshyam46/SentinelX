@@ -165,6 +165,10 @@ class LLMSecurityReport(BaseModel):
     ai_endpoints_discovered: list[str] = Field(default_factory=list)
     attack_chains: list[dict] = Field(default_factory=list)
     executive_summary: str = ""
+    # Surface detection (Phase 3 pre-flight)
+    llm_surface_detected: bool = False
+    llm_surface_confidence: float = 0.0
+    surface_warning: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

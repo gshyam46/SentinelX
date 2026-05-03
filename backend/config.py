@@ -4,6 +4,7 @@ Loads settings from environment variables / .env file via pydantic-settings.
 """
 
 from functools import lru_cache
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,13 +33,20 @@ class Settings(BaseSettings):
     # --- Security / JWT ---
     SECRET_KEY: str = "change-this-to-a-random-64-char-string"
     JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRE_MINUTES: int = 1440  # 24 hours
+    JWT_EXPIRE_MINUTES: int = 60   # max 60 minutes — enforced by validator below
+
+    # --- Rate Limiting ---
+    RATE_LIMIT_AUTH: str = "10/minute"   # applied to /auth/login and /auth/register
 
     # --- CORS ---
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
 
     # --- LLM (via LiteLLM) ---
-    LITELLM_MODEL: str = "groq/llama-3.1-70b-versatile"
+    # llama3-70b-8192  = stable Groq alias (recommended)
+    # llama-3.3-70b-versatile = latest Groq alias
+    # llama-3.1-70b-versatile = DECOMMISSIONED — do NOT use
+    LITELLM_MODEL: str = "groq/llama-3.3-70b-versatile"
+    LITELLM_FALLBACK_MODEL: str = "groq/llama-3.3-70b-versatile"
     GROQ_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
@@ -49,7 +57,15 @@ class Settings(BaseSettings):
     OTX_API_KEY: str = ""
 
     # --- Tool Execution ---
-    TOOL_TIMEOUT_SECONDS: int = 120  # Hard subprocess timeout for Nmap/Nuclei/ZAP
+    TOOL_TIMEOUT_SECONDS: int = 120  # Hard subprocess timeout for Nmap/Nuclei
+
+    # --- ZAP REST ---
+    ZAP_BASE_URL: str = "http://zap:8090"
+    ZAP_TIMEOUT_SECONDS: int = 600
+
+    # --- Tool binary paths (empty = auto-resolve via PATH) ---
+    NMAP_PATH: str = ""
+    NUCLEI_PATH: str = ""
 
     # --- Dev / Mock ---
     MOCK_MODE: bool = False  # Set True on Windows — tool wrappers return structured fake JSON
@@ -60,6 +76,25 @@ class Settings(BaseSettings):
 
     # --- Rate Limits ---
     MAX_FREE_SCANS_PER_DAY: int = 3
+
+    @field_validator("SECRET_KEY")
+    @classmethod
+    def _require_strong_secret(cls, v: str) -> str:
+        if v == "change-this-to-a-random-64-char-string":
+            import logging
+            logging.getLogger("sentinelx.config").warning(
+                "SECRET_KEY is set to the default placeholder — set a strong random value in .env"
+            )
+        if len(v) < 32:
+            raise ValueError("SECRET_KEY must be at least 32 characters")
+        return v
+
+    @field_validator("JWT_EXPIRE_MINUTES")
+    @classmethod
+    def _cap_jwt_expiry(cls, v: int) -> int:
+        if v > 60:
+            raise ValueError("JWT_EXPIRE_MINUTES must not exceed 60 (security policy)")
+        return v
 
     @property
     def cors_origins_list(self) -> list[str]:

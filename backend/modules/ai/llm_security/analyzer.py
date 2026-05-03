@@ -26,10 +26,29 @@ import logging
 import time
 from typing import Any, Optional
 
+import aiohttp
+
 from backend.modules.ai.llm_security.base import LLMRiskItem, LLMSecurityReport
 from backend.modules.ai.llm_security.checks import ALL_CHECKS
 
 logger = logging.getLogger("sentinelx.llmsec.analyzer")
+
+# ---------------------------------------------------------------------------
+# Pre-flight surface detection constants
+# ---------------------------------------------------------------------------
+
+_PREFLIGHT_PATHS: list[str] = [
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/api/chat",
+]
+
+_PREFLIGHT_HEADER_PATTERNS: list[str] = [
+    "x-openai-",
+    "anthropic-",
+    "x-groq-",
+]
 
 # ---------------------------------------------------------------------------
 # Severity → weight mapping for risk score
@@ -173,6 +192,73 @@ _CHAIN_RULES: list[dict[str, Any]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Pre-flight LLM surface detection
+# ---------------------------------------------------------------------------
+
+async def _preflight_detect(target: str) -> tuple[bool, float, str | None]:
+    """
+    Probe standard LLM API paths to determine if the target hosts an LLM surface.
+
+    Scoring:
+      200/401/405 on any probe path → +0.5  (endpoint exists)
+      200 on any probe path         → +0.3  (endpoint accessible without auth)
+      AI provider headers present   → +0.4  (confirmed LLM backend)
+      confidence capped at 1.0
+
+    Returns (detected, confidence, surface_warning).
+    """
+    base = target if target.startswith(("http://", "https://")) else f"https://{target}"
+    urls = [f"{base}{p}" for p in _PREFLIGHT_PATHS]
+
+    statuses: list[int] = []
+    header_evidence: list[str] = []
+
+    connector = aiohttp.TCPConnector(ssl=False, limit=10)
+    timeout_cfg = aiohttp.ClientTimeout(total=5, connect=3)
+
+    async def _head(session: aiohttp.ClientSession, url: str) -> None:
+        try:
+            async with session.head(
+                url,
+                headers={"User-Agent": "SentinelX-LLMSec/1.0"},
+                allow_redirects=False,
+            ) as resp:
+                statuses.append(resp.status)
+                for hdr in resp.headers:
+                    if any(pat in hdr.lower() for pat in _PREFLIGHT_HEADER_PATTERNS):
+                        header_evidence.append(f"{hdr}: {resp.headers[hdr][:80]}")
+        except Exception:
+            statuses.append(0)
+
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout_cfg) as session:
+            await asyncio.gather(*[_head(session, u) for u in urls])
+    except Exception:
+        pass
+
+    confidence = 0.0
+    if any(s in (200, 401, 405) for s in statuses):
+        confidence += 0.5
+    if any(s == 200 for s in statuses):
+        confidence += 0.3
+    if header_evidence:
+        confidence += 0.4
+    confidence = min(1.0, confidence)
+
+    detected = confidence >= 0.4
+    warning: str | None = None
+    if not detected:
+        warning = (
+            "No LLM API surface detected at standard paths. "
+            "Findings are based on passive indicators only — "
+            "confidence threshold raised to 0.6 and risk score capped at 2.0. "
+            "Provide llm_endpoint to enable full active assessment."
+        )
+
+    return detected, round(confidence, 3), warning
+
+
 class LLMSecurityAnalyzer:
     """
     Orchestrates all OWASP LLM Top 10 checks concurrently and produces
@@ -187,20 +273,43 @@ class LLMSecurityAnalyzer:
         target: str,
         recon_result: dict[str, Any] | None = None,
         findings: list[dict[str, Any]] | None = None,
+        llm_endpoint: str | None = None,
     ) -> LLMSecurityReport:
         """
         Run all 10 checks concurrently against the target.
 
         Args:
-            target:       Domain or URL of the target application.
-            recon_result: Passive recon data (headers, endpoints, etc.) from Phase 1.
-            findings:     Existing vulnerability findings from prior scans.
+            target:        Domain or URL of the target application.
+            recon_result:  Passive recon data (headers, endpoints, etc.) from Phase 1.
+            findings:      Existing vulnerability findings from prior scans.
+            llm_endpoint:  Explicit LLM API endpoint. When provided, pre-flight
+                           detection is skipped and surface confidence is set to 1.0.
 
         Returns:
             LLMSecurityReport — never raises. Failed checks return detected=False.
         """
-        recon_result = recon_result or {}
+        recon_result = dict(recon_result or {})
         findings = findings or []
+
+        # Pre-flight surface detection
+        if llm_endpoint:
+            llm_surface_detected = True
+            llm_surface_confidence = 1.0
+            surface_warning: str | None = None
+            # Inject explicit endpoint so checks can discover it via recon_result
+            recon_result["llm_endpoint"] = llm_endpoint
+            logger.info("[LLMSec] Explicit llm_endpoint=%s — skipping detection", llm_endpoint)
+        else:
+            llm_surface_detected, llm_surface_confidence, surface_warning = (
+                await _preflight_detect(target)
+            )
+            logger.info(
+                "[LLMSec] Pre-flight: detected=%s confidence=%.2f",
+                llm_surface_detected, llm_surface_confidence,
+            )
+
+        # Confidence threshold for filtering individual check results
+        confidence_threshold = 0.4 if llm_surface_detected else 0.6
 
         logger.info("[LLMSec] Starting analysis of %s (%d checks)", target, len(self._checks))
         t_start = time.monotonic()
@@ -220,12 +329,21 @@ class LLMSecurityAnalyzer:
             all_endpoints.extend(item.endpoints_tested)
         ai_endpoints_discovered = list(dict.fromkeys(all_endpoints))
 
-        # Filter detected risks
-        detected_risks = [r for r in risk_items if r.detected]
+        # Filter detected risks by confidence threshold to suppress low-confidence
+        # hallucinated findings when no LLM surface was observed
+        detected_risks = [
+            r for r in risk_items
+            if r.detected and r.confidence >= confidence_threshold
+        ]
         issues_found = len(detected_risks)
 
-        # Compute risk score
-        llm_risk_score = _compute_risk_score(risk_items)
+        # Compute risk score from threshold-filtered risks only
+        llm_risk_score = _compute_risk_score(detected_risks)
+
+        # Cap score at 2.0 when no LLM surface was detected — findings are
+        # passive-only and may not reflect real exposure
+        if not llm_surface_detected:
+            llm_risk_score = min(2.0, llm_risk_score)
 
         # Derive attack chains
         attack_chains = _derive_attack_chains(risk_items)
@@ -250,6 +368,9 @@ class LLMSecurityAnalyzer:
             ai_endpoints_discovered=ai_endpoints_discovered[:20],
             attack_chains=attack_chains,
             executive_summary=executive_summary,
+            llm_surface_detected=llm_surface_detected,
+            llm_surface_confidence=llm_surface_confidence,
+            surface_warning=surface_warning,
         )
 
     @staticmethod
@@ -287,14 +408,14 @@ class LLMSecurityAnalyzer:
 # Risk scoring
 # ---------------------------------------------------------------------------
 
-def _compute_risk_score(risk_items: list[LLMRiskItem]) -> float:
+def _compute_risk_score(detected_risks: list[LLMRiskItem]) -> float:
     """
-    Weighted score: sum(confidence × severity_weight) for detected risks, capped at 10.
+    Weighted score: sum(confidence × severity_weight), capped at 10.
+    Input must be pre-filtered to detected risks above the confidence threshold.
     """
     raw = sum(
         item.confidence * _SEV_WEIGHT.get(item.severity, 0.0)
-        for item in risk_items
-        if item.detected
+        for item in detected_risks
     )
     return min(10.0, raw)
 

@@ -201,12 +201,21 @@ export default function ExecutionGraph({
 }: Props) {
   const [selected, setSelected] = useState<Node | null>(null)
 
-  const mergedNodes = graphData
-    ? [...graphData.nodes, ...liveNodes.filter(ln => !graphData.nodes.find(n => n.id === ln.id))]
-    : liveNodes
-  const mergedEdges = graphData
-    ? [...graphData.edges, ...liveEdges.filter(le => !graphData.edges.find(e => e.id === le.id))]
-    : liveEdges
+  // Defensive null-coercion: the backend returns null for nodes/edges on passive
+  // scans (no active graph). graphData may be truthy ({nodes: null, edges: null})
+  // which causes Array.prototype.filter() to throw "Cannot read property 'filter'
+  // of null" and blank the entire page.
+  const safeNodes: RawNode[] = Array.isArray(graphData?.nodes) ? graphData!.nodes : []
+  const safeEdges: RawEdge[] = Array.isArray(graphData?.edges) ? graphData!.edges : []
+
+  const mergedNodes = [
+    ...safeNodes,
+    ...liveNodes.filter(ln => !safeNodes.find(n => n.id === ln.id)),
+  ]
+  const mergedEdges = [
+    ...safeEdges,
+    ...liveEdges.filter(le => !safeEdges.find(e => e.id === le.id)),
+  ]
 
   const [nodes, setNodes, onNodesChange] = useNodesState(layoutNodes(mergedNodes))
   const [edges, setEdges, onEdgesChange] = useEdgesState(layoutEdges(mergedEdges))

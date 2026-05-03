@@ -48,7 +48,7 @@ export default function App() {
             <Route path="scans/:scanId/llm-security" element={<LLMSecurity />} />
             <Route path="reports"                element={<Dashboard />} />
             <Route path="settings"               element={<Dashboard />} />
-            <Route path="llm"                    element={<Dashboard />} />
+            <Route path="llm"                    element={<LLMSecurity />} />
           </Route>
 
           <Route path="*" element={<Navigate to="/" replace />} />

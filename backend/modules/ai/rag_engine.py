@@ -159,26 +159,33 @@ class RAGEngine:
         total = sum(len(v) for v in self._kb.values())
         logger.info("RAG: Knowledge base loaded — %d total entries", total)
 
-        # 2. Attempt FAISS index
-        try:
-            import faiss  # type: ignore
-            import numpy as np
-            from sentence_transformers import SentenceTransformer  # type: ignore
+        # 2. Attempt FAISS index (skipped when DISABLE_FAISS=1 — prevents post-fork OpenMP deadlock in Celery prefork workers)
+        import os
+        _disable_faiss = os.getenv("DISABLE_FAISS", "").lower() in ("1", "true", "yes")
 
-            self._model = SentenceTransformer("all-MiniLM-L6-v2")
-            self._build_faiss_index(faiss, np)
-            self._use_faiss = True
-            self._retrieval_method = "faiss"
-            logger.info(
-                "RAG: FAISS index built (%d vectors, dim=384, all-MiniLM-L6-v2)",
-                len(self._index_docs),
-            )
-        except ImportError as exc:
-            logger.warning("RAG: FAISS/sentence-transformers not available (%s) — using keyword fallback", exc)
+        if _disable_faiss:
+            logger.info("RAG: FAISS disabled via DISABLE_FAISS env var — using keyword fallback (Celery-safe)")
             self._retrieval_method = "keyword"
-        except Exception as exc:
-            logger.error("RAG: FAISS index build failed (%s) — using keyword fallback", exc)
-            self._retrieval_method = "keyword"
+        else:
+            try:
+                import faiss  # type: ignore
+                import numpy as np
+                from sentence_transformers import SentenceTransformer  # type: ignore
+
+                self._model = SentenceTransformer("all-MiniLM-L6-v2")
+                self._build_faiss_index(faiss, np)
+                self._use_faiss = True
+                self._retrieval_method = "faiss"
+                logger.info(
+                    "RAG: FAISS index built (%d vectors, dim=384, all-MiniLM-L6-v2)",
+                    len(self._index_docs),
+                )
+            except ImportError as exc:
+                logger.warning("RAG: FAISS/sentence-transformers not available (%s) — using keyword fallback", exc)
+                self._retrieval_method = "keyword"
+            except Exception as exc:
+                logger.error("RAG: FAISS index build failed (%s) — using keyword fallback", exc)
+                self._retrieval_method = "keyword"
 
         # 3. Load KEV catalog from local cache (sync — no network at startup)
         try:

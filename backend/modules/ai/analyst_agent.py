@@ -602,23 +602,48 @@ Think step by step but respond only with the JSON schema."""
             from backend.config import get_settings
 
             settings = get_settings()
-            response = await litellm.acompletion(
-                model=settings.LITELLM_MODEL,
-                messages=[
-                    {"role": "system", "content": resolved_system},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=_MAX_OUTPUT_TOKENS,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-            return response.choices[0].message.content
+
+            # Models to try in order: primary → fallback
+            models_to_try = [settings.LITELLM_MODEL]
+            fallback = getattr(settings, "LITELLM_FALLBACK_MODEL", None)
+            if fallback and fallback != settings.LITELLM_MODEL:
+                models_to_try.append(fallback)
+
+            last_exc: Exception | None = None
+            for model in models_to_try:
+                try:
+                    response = await litellm.acompletion(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": resolved_system},
+                            {"role": "user", "content": prompt},
+                        ],
+                        max_tokens=_MAX_OUTPUT_TOKENS,
+                        temperature=0.1,
+                        # NOTE: response_format=json_object is intentionally omitted.
+                        # Groq llama3 models do not support it and return a 400 error.
+                        # The system prompt already instructs the LLM to output JSON only.
+                    )
+                    content = response.choices[0].message.content
+                    logger.info("[Analyst] LLM call succeeded with model: %s", model)
+                    return content
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "[Analyst] LLM call failed for model '%s': %s — %s",
+                        model,
+                        type(exc).__name__,
+                        exc,
+                    )
+
+            logger.error("[Analyst] All LLM models failed. Last error: %s", last_exc)
+            return None
 
         except ImportError:
             logger.warning("[Analyst] litellm not installed — using mock response")
             return self._mock_response()
         except Exception as exc:
-            logger.error("[Analyst] LLM call failed: %s", exc)
+            logger.error("[Analyst] LLM call unexpected error: %s", exc)
             return None
 
     def _mock_response(self) -> str:

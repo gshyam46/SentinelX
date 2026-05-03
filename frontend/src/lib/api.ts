@@ -248,6 +248,13 @@ http.interceptors.request.use((config) => {
   return config
 })
 
+// Attach dev tier-bypass header automatically (only when env var is set)
+const DEV_BYPASS_SECRET = import.meta.env.VITE_DEV_BYPASS_SECRET
+http.interceptors.request.use((config) => {
+  if (DEV_BYPASS_SECRET) config.headers['X-Dev-Bypass'] = DEV_BYPASS_SECRET
+  return config
+})
+
 // ─── API methods ──────────────────────────────────────────────────────
 
 export const api = {

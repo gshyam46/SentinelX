@@ -3,20 +3,30 @@ SentinelX — Auth Router
 User registration and JWT login endpoints.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.session import get_db
 from backend.models.user import User
 from backend.schemas.user import UserCreate, UserLogin, UserResponse, TokenResponse
-from backend.api.deps import hash_password, verify_password, create_access_token, get_current_user
+from backend.api.deps import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    limiter,
+)
+from backend.config import get_settings
 
+_settings = get_settings()
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit(_settings.RATE_LIMIT_AUTH)
 async def register(
+    request: Request,
     data: UserCreate,
     db: AsyncSession = Depends(get_db),
 ):
@@ -50,7 +60,9 @@ async def register(
 
 
 @router.post("/login", response_model=TokenResponse)
+@limiter.limit(_settings.RATE_LIMIT_AUTH)
 async def login(
+    request: Request,
     data: UserLogin,
     db: AsyncSession = Depends(get_db),
 ):

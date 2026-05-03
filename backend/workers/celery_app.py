@@ -12,6 +12,9 @@ from kombu import Queue
 
 from backend.config import get_settings
 
+# Force all SQLAlchemy models into Base.metadata at worker startup.
+import backend.models  # noqa: F401
+
 logger = logging.getLogger("sentinelx.celery")
 settings = get_settings()
 

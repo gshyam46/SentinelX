@@ -102,10 +102,13 @@ export default function ScanDetail() {
 
   const toolStartTimes = useRef<Map<string,number>>(new Map())
   const [tick, setTick] = useState(0)
+  // Guard: prevent duplicate getScanReport calls from WS reconnect loop or StrictMode double-mount
+  const reportFetchedRef = useRef(false)
 
   // Initial load
   useEffect(() => {
     if (!scanId) return
+    reportFetchedRef.current = false
     let alive = true
     ;(async () => {
       try {
@@ -114,10 +117,14 @@ export default function ScanDetail() {
         setScan(d)
         setLiveFindings(d.results?.findings ?? [])
         setLoading(false)
-        try {
-          const r = await api.getScanReport(scanId)
-          if (alive) setReport(r)
-        } catch { /* not ready */ }
+        // Only fetch report when scan is complete and report_ready flag is set
+        if (d.status === 'complete' && d.results?.report_ready && !reportFetchedRef.current) {
+          reportFetchedRef.current = true
+          try {
+            const r = await api.getScanReport(scanId)
+            if (alive) setReport(r)
+          } catch { /* not ready yet */ }
+        }
       } catch {
         if (alive) setLoading(false)
       }
@@ -153,10 +160,15 @@ export default function ScanDetail() {
   const handleScanComplete = useCallback(async () => {
     if (!scanId) return
     try {
-      const [d, r] = await Promise.all([api.getScan(scanId), api.getScanReport(scanId).catch(() => null)])
+      const d = await api.getScan(scanId)
       setScan(d)
       setLiveFindings(d.results?.findings ?? [])
-      if (r) setReport(r)
+      // Only fetch report when backend signals it is ready and we haven't fetched yet
+      if (d.results?.report_ready && !reportFetchedRef.current) {
+        reportFetchedRef.current = true
+        const r = await api.getScanReport(scanId).catch(() => null)
+        if (r) setReport(r)
+      }
     } catch { /* ignore */ }
   }, [scanId])
 

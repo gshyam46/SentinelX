@@ -345,24 +345,40 @@ Decide the next action."""
         from backend.config import get_settings
 
         settings = get_settings()
-        response = await litellm.acompletion(
-            model=settings.LITELLM_MODEL,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            max_tokens=400,
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
-        raw = response.choices[0].message.content.strip()
-        return _parse_llm_json(raw, state)
+        models_to_try = [settings.LITELLM_MODEL]
+        fallback = getattr(settings, "LITELLM_FALLBACK_MODEL", None)
+        if fallback and fallback != settings.LITELLM_MODEL:
+            models_to_try.append(fallback)
+
+        last_exc: Exception | None = None
+        for model in models_to_try:
+            try:
+                response = await litellm.acompletion(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    max_tokens=400,
+                    temperature=0.1,
+                    # NOTE: response_format=json_object intentionally omitted —
+                    # Groq llama3 models return 400 for this parameter.
+                )
+                raw = response.choices[0].message.content.strip()
+                logger.info("[%s] LLM orchestrator decision: model=%s", state.scan_id, model)
+                return _parse_llm_json(raw, state)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "[%s] LLM decision failed for model '%s': %s — trying next",
+                    state.scan_id, model, exc,
+                )
+
+        logger.error("[%s] All LLM models failed for orchestrator decision: %s", state.scan_id, last_exc)
+        return _rule_based_decision(state)
 
     except ImportError:
         logger.warning("litellm not installed — using rule-based fallback decision")
-        return _rule_based_decision(state)
-    except Exception as exc:
-        logger.error(f"LLM decision call failed: {exc}", exc_info=True)
         return _rule_based_decision(state)
 
 
